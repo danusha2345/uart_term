@@ -594,9 +594,8 @@ impl UartTermApp {
                     .hint_text("uart_log.txt"),
             );
 
-            if ui.button("...").on_hover_text("Choose log file").clicked()
-                && self.file_dialog_rx.is_none()
-            {
+            if ui.button("...").on_hover_text("Choose log file").clicked() {
+              if self.file_dialog_rx.is_none() {
                 let (tx, rx) = std::sync::mpsc::channel();
                 self.file_dialog_rx = Some(rx);
                 std::thread::spawn(move || {
@@ -609,6 +608,7 @@ impl UartTermApp {
                         let _ = tx.send(path.to_string_lossy().to_string());
                     }
                 });
+              }
             }
         });
     }
