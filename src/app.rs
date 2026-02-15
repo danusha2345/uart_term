@@ -994,12 +994,12 @@ impl UartTermApp {
         let label_color = egui::Color32::from_rgb(120, 180, 255); // light blue
         let ascii_color = egui::Color32::from_rgb(180, 160, 200); // muted purple
 
+        let mono = egui::FontId::monospace(13.0);
+
         egui::ScrollArea::vertical()
             .auto_shrink([false; 2])
             .stick_to_bottom(self.auto_scroll)
             .show(ui, |ui| {
-                ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
-
                 for pkt in &self.packets {
                     // Apply display filter (TX always visible)
                     if !self.filter_bytes.is_empty()
@@ -1017,93 +1017,41 @@ impl UartTermApp {
                     let hex = pkt.hex_string();
 
                     let mut job = egui::text::LayoutJob::default();
-                    job.wrap = egui::text::TextWrapping {
-                        max_rows: 0, // unlimited
-                        break_anywhere: true,
-                        overflow_character: None,
-                        max_width: ui.available_width(),
+
+                    let fmt = |color: egui::Color32| egui::TextFormat {
+                        color,
+                        font_id: mono.clone(),
+                        ..Default::default()
                     };
 
                     // Arrow
-                    job.append(
-                        arrow,
-                        0.0,
-                        egui::TextFormat {
-                            color: dir_color,
-                            font_id: egui::FontId::monospace(13.0),
-                            ..Default::default()
-                        },
-                    );
+                    job.append(arrow, 0.0, fmt(dir_color));
 
                     // Timestamp
                     let ts = format!("{:10.3}s  ", pkt.timestamp);
-                    job.append(
-                        &ts,
-                        0.0,
-                        egui::TextFormat {
-                            color: ts_color,
-                            font_id: egui::FontId::monospace(13.0),
-                            ..Default::default()
-                        },
-                    );
+                    job.append(&ts, 0.0, fmt(ts_color));
 
                     // Data columns based on display format
                     match self.display_format {
                         DataFormat::Hex => {
-                            job.append(
-                                &hex,
-                                0.0,
-                                egui::TextFormat {
-                                    color: dir_color,
-                                    font_id: egui::FontId::monospace(13.0),
-                                    ..Default::default()
-                                },
-                            );
+                            job.append(&hex, 0.0, fmt(dir_color));
                         }
                         DataFormat::Ascii => {
-                            job.append(
-                                &pkt.ascii_string(),
-                                0.0,
-                                egui::TextFormat {
-                                    color: dir_color,
-                                    font_id: egui::FontId::monospace(13.0),
-                                    ..Default::default()
-                                },
-                            );
+                            job.append(&pkt.ascii_string(), 0.0, fmt(dir_color));
                         }
                         DataFormat::HexAscii => {
-                            job.append(
-                                &hex,
-                                0.0,
-                                egui::TextFormat {
-                                    color: dir_color,
-                                    font_id: egui::FontId::monospace(13.0),
-                                    ..Default::default()
-                                },
-                            );
+                            job.append(&hex, 0.0, fmt(dir_color));
                             job.append(
                                 &format!("  |{}|", pkt.ascii_string()),
                                 0.0,
-                                egui::TextFormat {
-                                    color: ascii_color,
-                                    font_id: egui::FontId::monospace(13.0),
-                                    ..Default::default()
-                                },
+                                fmt(ascii_color),
                             );
                         }
                     }
 
                     // Label
                     if let Some(ref label) = pkt.label {
-                        job.append(
-                            &format!("  {}", label),
-                            0.0,
-                            egui::TextFormat {
-                                color: label_color,
-                                font_id: egui::FontId::monospace(13.0),
-                                ..Default::default()
-                            },
-                        );
+                        job.append(&format!("  {}", label), 0.0, fmt(label_color));
                     }
 
                     let response = ui.label(job);
@@ -1122,12 +1070,16 @@ impl UartTermApp {
     }
 
     fn draw_send_bar(&mut self, ui: &mut egui::Ui) {
+        // Right-side buttons width: LineEnding(~75) + Send(~45) + Clear(~50) + Auto-scroll(~85) + Display(~110) + gaps(~60)
+        let right_width = 430.0;
+
         ui.horizontal(|ui| {
             ui.label("HEX:");
 
+            let input_width = (ui.available_width() - right_width).max(80.0);
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut self.send_input)
-                    .desired_width(ui.available_width() - 340.0)
+                    .desired_width(input_width)
                     .hint_text("B5 62 06 01 ...")
                     .font(egui::TextStyle::Monospace),
             );
@@ -1163,6 +1115,16 @@ impl UartTermApp {
                 self.send_input.clear();
                 self.send_history_idx = None;
             }
+
+            // Line ending — right after input
+            egui::ComboBox::from_id_salt("le_combo")
+                .selected_text(self.line_ending.label())
+                .width(45.0)
+                .show_ui(ui, |ui| {
+                    for le in LineEnding::ALL {
+                        ui.selectable_value(&mut self.line_ending, le, le.label());
+                    }
+                });
 
             let can_send = self.is_connected();
             if ui
@@ -1205,17 +1167,6 @@ impl UartTermApp {
                     ui.selectable_value(&mut self.display_format, DataFormat::Hex, "HEX");
                     ui.selectable_value(&mut self.display_format, DataFormat::Ascii, "ASCII");
                     ui.selectable_value(&mut self.display_format, DataFormat::HexAscii, "HEX+ASCII");
-                });
-
-            ui.separator();
-
-            egui::ComboBox::from_id_salt("le_combo")
-                .selected_text(self.line_ending.label())
-                .width(55.0)
-                .show_ui(ui, |ui| {
-                    for le in LineEnding::ALL {
-                        ui.selectable_value(&mut self.line_ending, le, le.label());
-                    }
                 });
         });
     }
