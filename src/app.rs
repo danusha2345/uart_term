@@ -63,6 +63,17 @@ pub enum TransportMode {
     Ble,
 }
 
+/// Data display/log format
+#[derive(Clone, Copy, PartialEq)]
+pub enum DataFormat {
+    Hex,
+    Ascii,
+    HexAscii,
+}
+
+/// What to include in log file (re-export for logger)
+pub type LogFormat = DataFormat;
+
 pub struct UartTermApp {
     // Transport
     transport_mode: TransportMode,
@@ -97,6 +108,7 @@ pub struct UartTermApp {
     delimiter_input: String,
 
     // Display
+    display_format: DataFormat,
     packets: Vec<Packet>,
     auto_scroll: bool,
     max_packets: usize,
@@ -115,6 +127,7 @@ pub struct UartTermApp {
 
     // Logging
     log_enabled: bool,
+    log_format: LogFormat,
     log_path: String,
     logger: Option<Logger>,
     file_dialog_rx: Option<std::sync::mpsc::Receiver<String>>,
@@ -154,6 +167,7 @@ impl UartTermApp {
             parser: StreamParser::new(vec![0xB5, 0x62]),
             delimiter_input: "B5 62".to_string(),
 
+            display_format: DataFormat::HexAscii,
             packets: Vec::new(),
             auto_scroll: true,
             max_packets: 10000,
@@ -168,10 +182,25 @@ impl UartTermApp {
             dtr_state: false,
             rts_state: false,
 
-            log_enabled: false,
-            log_path: "uart_log.txt".to_string(),
+            log_enabled: true,
+            log_format: LogFormat::Hex,
+            log_path: Self::make_log_path(),
             logger: None,
             file_dialog_rx: None,
+        }
+    }
+
+    fn make_log_path() -> String {
+        chrono::Local::now().format("log_%Y-%m-%d_%H-%M-%S.txt").to_string()
+    }
+
+    fn start_logger(&mut self) {
+        if self.log_enabled {
+            self.log_path = Self::make_log_path();
+            match Logger::new(&self.log_path, self.log_format) {
+                Ok(l) => self.logger = Some(l),
+                Err(e) => self.status_msg = format!("Log error: {}", e),
+            }
         }
     }
 
@@ -204,13 +233,7 @@ impl UartTermApp {
                 } else {
                     self.parser = StreamParser::new(vec![0xB5, 0x62]);
                 }
-                // Start logger if enabled
-                if self.log_enabled && self.logger.is_none() {
-                    match Logger::new(&self.log_path) {
-                        Ok(l) => self.logger = Some(l),
-                        Err(e) => self.status_msg = format!("Log error: {}", e),
-                    }
-                }
+                self.start_logger();
             }
             Err(e) => {
                 self.status_msg = e;
@@ -329,13 +352,7 @@ impl UartTermApp {
                 if let Err(e) = handle.send_cmd(BleCmd::Connect(idx)) {
                     self.status_msg = format!("BLE connect error: {}", e);
                 }
-                // Start logger if enabled
-                if self.log_enabled && self.logger.is_none() {
-                    match Logger::new(&self.log_path) {
-                        Ok(l) => self.logger = Some(l),
-                        Err(e) => self.status_msg = format!("Log error: {}", e),
-                    }
-                }
+                self.start_logger();
             }
         }
     }
@@ -575,14 +592,23 @@ impl UartTermApp {
 
             let was_enabled = self.log_enabled;
             ui.checkbox(&mut self.log_enabled, "Log");
+
+            let fmt_label = match self.log_format {
+                LogFormat::Hex => "HEX",
+                LogFormat::Ascii => "ASCII",
+                LogFormat::HexAscii => "HEX+ASCII",
+            };
+            egui::ComboBox::from_id_salt("log_fmt_combo")
+                .selected_text(fmt_label)
+                .width(70.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.log_format, LogFormat::Hex, "HEX");
+                    ui.selectable_value(&mut self.log_format, LogFormat::Ascii, "ASCII");
+                    ui.selectable_value(&mut self.log_format, LogFormat::HexAscii, "HEX+ASCII");
+                });
+
             if self.log_enabled && !was_enabled && self.is_connected() {
-                match Logger::new(&self.log_path) {
-                    Ok(l) => self.logger = Some(l),
-                    Err(e) => {
-                        self.status_msg = format!("Log error: {}", e);
-                        self.log_enabled = false;
-                    }
-                }
+                self.start_logger();
             }
             if !self.log_enabled && was_enabled {
                 self.logger = None;
@@ -968,7 +994,7 @@ impl UartTermApp {
         let label_color = egui::Color32::from_rgb(120, 180, 255); // light blue
         let ascii_color = egui::Color32::from_rgb(180, 160, 200); // muted purple
 
-        egui::ScrollArea::vertical()
+        egui::ScrollArea::both()
             .auto_shrink([false; 2])
             .stick_to_bottom(self.auto_scroll)
             .show(ui, |ui| {
@@ -991,6 +1017,12 @@ impl UartTermApp {
                     let hex = pkt.hex_string();
 
                     let mut job = egui::text::LayoutJob::default();
+                    job.wrap = egui::text::TextWrapping {
+                        max_rows: 1,
+                        break_anywhere: false,
+                        overflow_character: None,
+                        max_width: f32::INFINITY,
+                    };
 
                     // Arrow
                     job.append(
@@ -1015,27 +1047,51 @@ impl UartTermApp {
                         },
                     );
 
-                    // Hex data
-                    job.append(
-                        &hex,
-                        0.0,
-                        egui::TextFormat {
-                            color: dir_color,
-                            font_id: egui::FontId::monospace(13.0),
-                            ..Default::default()
-                        },
-                    );
-
-                    // ASCII column
-                    job.append(
-                        &format!("  |{}|", pkt.ascii_string()),
-                        0.0,
-                        egui::TextFormat {
-                            color: ascii_color,
-                            font_id: egui::FontId::monospace(13.0),
-                            ..Default::default()
-                        },
-                    );
+                    // Data columns based on display format
+                    match self.display_format {
+                        DataFormat::Hex => {
+                            job.append(
+                                &hex,
+                                0.0,
+                                egui::TextFormat {
+                                    color: dir_color,
+                                    font_id: egui::FontId::monospace(13.0),
+                                    ..Default::default()
+                                },
+                            );
+                        }
+                        DataFormat::Ascii => {
+                            job.append(
+                                &pkt.ascii_string(),
+                                0.0,
+                                egui::TextFormat {
+                                    color: dir_color,
+                                    font_id: egui::FontId::monospace(13.0),
+                                    ..Default::default()
+                                },
+                            );
+                        }
+                        DataFormat::HexAscii => {
+                            job.append(
+                                &hex,
+                                0.0,
+                                egui::TextFormat {
+                                    color: dir_color,
+                                    font_id: egui::FontId::monospace(13.0),
+                                    ..Default::default()
+                                },
+                            );
+                            job.append(
+                                &format!("  |{}|", pkt.ascii_string()),
+                                0.0,
+                                egui::TextFormat {
+                                    color: ascii_color,
+                                    font_id: egui::FontId::monospace(13.0),
+                                    ..Default::default()
+                                },
+                            );
+                        }
+                    }
 
                     // Label
                     if let Some(ref label) = pkt.label {
@@ -1133,6 +1189,23 @@ impl UartTermApp {
             {
                 self.auto_scroll = !self.auto_scroll;
             }
+
+            ui.separator();
+
+            // Display format
+            let disp_label = match self.display_format {
+                DataFormat::Hex => "HEX",
+                DataFormat::Ascii => "ASCII",
+                DataFormat::HexAscii => "HEX+ASCII",
+            };
+            egui::ComboBox::from_id_salt("disp_fmt_combo")
+                .selected_text(disp_label)
+                .width(70.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.display_format, DataFormat::Hex, "HEX");
+                    ui.selectable_value(&mut self.display_format, DataFormat::Ascii, "ASCII");
+                    ui.selectable_value(&mut self.display_format, DataFormat::HexAscii, "HEX+ASCII");
+                });
 
             ui.separator();
 
