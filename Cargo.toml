@@ -8,3 +8,7 @@ eframe = "0.33"
 serialport = "4.8"
 chrono = "0.4"
 rfd = "0.17"
+btleplug = "0.11"
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+futures = "0.3"
+uuid = "1"

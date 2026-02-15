@@ -1,4 +1,5 @@
 mod app;
+mod ble;
 mod logger;
 mod parser;
 mod serial;
