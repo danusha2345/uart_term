@@ -583,7 +583,6 @@ impl UartTermApp {
                     .hint_text("e.g. B5 62 06 41"),
             );
             if filter_resp.changed() {
-                self.filter_input = format_hex_input(&self.filter_input);
                 self.filter_bytes =
                     parser::parse_hex_string(&self.filter_input).unwrap_or_default();
             }
