@@ -27,8 +27,8 @@ impl Logger {
 
     pub fn log_packet(&mut self, packet: &Packet) {
         let dir = match packet.direction {
-            Direction::Rx => "RX",
-            Direction::Tx => "TX",
+            Direction::Rx => "<",
+            Direction::Tx => ">",
         };
         let label = packet.label.as_deref().unwrap_or("");
 
@@ -36,32 +36,22 @@ impl Logger {
             LogFormat::Hex => {
                 let _ = writeln!(
                     self.file,
-                    "{:10.3}s {} {} {}",
-                    packet.timestamp,
-                    dir,
-                    packet.hex_string(),
-                    label
+                    "{} {:.3}s {} {}",
+                    dir, packet.timestamp, packet.hex_string(), label
                 );
             }
             LogFormat::Ascii => {
                 let _ = writeln!(
                     self.file,
-                    "{:10.3}s {} {} {}",
-                    packet.timestamp,
-                    dir,
-                    packet.ascii_string(),
-                    label
+                    "{} {:.3}s {} {}",
+                    dir, packet.timestamp, packet.ascii_string(), label
                 );
             }
             LogFormat::HexAscii => {
                 let _ = writeln!(
                     self.file,
-                    "{:10.3}s {} {} |{}| {}",
-                    packet.timestamp,
-                    dir,
-                    packet.hex_string(),
-                    packet.ascii_string(),
-                    label
+                    "{} {:.3}s {} |{}| {}",
+                    dir, packet.timestamp, packet.hex_string(), packet.ascii_string(), label
                 );
             }
         }

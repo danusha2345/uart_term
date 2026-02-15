@@ -548,7 +548,7 @@ impl UartTermApp {
     // --- UI ---
 
     fn draw_toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             // Transport mode selector
             ui.selectable_value(&mut self.transport_mode, TransportMode::Serial, "Serial");
             ui.selectable_value(&mut self.transport_mode, TransportMode::Ble, "BLE");
@@ -560,7 +560,7 @@ impl UartTermApp {
             }
         });
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Delimiter:");
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut self.delimiter_input)
@@ -620,8 +620,9 @@ impl UartTermApp {
                     .hint_text("uart_log.txt"),
             );
 
-            if ui.button("...").on_hover_text("Choose log file").clicked() {
-              if self.file_dialog_rx.is_none() {
+            if ui.button("...").on_hover_text("Choose log file").clicked()
+                && self.file_dialog_rx.is_none()
+            {
                 let (tx, rx) = std::sync::mpsc::channel();
                 self.file_dialog_rx = Some(rx);
                 std::thread::spawn(move || {
@@ -634,7 +635,6 @@ impl UartTermApp {
                         let _ = tx.send(path.to_string_lossy().to_string());
                     }
                 });
-              }
             }
         });
     }
@@ -994,7 +994,7 @@ impl UartTermApp {
         let label_color = egui::Color32::from_rgb(120, 180, 255); // light blue
         let ascii_color = egui::Color32::from_rgb(180, 160, 200); // muted purple
 
-        egui::ScrollArea::both()
+        egui::ScrollArea::vertical()
             .auto_shrink([false; 2])
             .stick_to_bottom(self.auto_scroll)
             .show(ui, |ui| {
@@ -1018,10 +1018,10 @@ impl UartTermApp {
 
                     let mut job = egui::text::LayoutJob::default();
                     job.wrap = egui::text::TextWrapping {
-                        max_rows: 1,
-                        break_anywhere: false,
+                        max_rows: 0, // unlimited
+                        break_anywhere: true,
                         overflow_character: None,
-                        max_width: f32::INFINITY,
+                        max_width: ui.available_width(),
                     };
 
                     // Arrow
