@@ -20,6 +20,11 @@ fn format_hex_input(raw: &str) -> String {
     out
 }
 
+/// Extract short port name from full path: "/dev/ttyUSB0" -> "ttyUSB0", "COM3" -> "COM3"
+fn short_port_name(port: &str) -> String {
+    port.rsplit('/').next().unwrap_or(port).to_string()
+}
+
 /// Line ending appended to sent data
 #[derive(Clone, Copy, PartialEq)]
 pub enum LineEnding {
@@ -74,12 +79,9 @@ pub enum DataFormat {
 /// What to include in log file (re-export for logger)
 pub type LogFormat = DataFormat;
 
-pub struct UartTermApp {
-    // Transport
-    transport_mode: TransportMode,
-
-    // Serial connection
-    available_ports: Vec<String>,
+/// Per-connection serial state
+struct SerialConn {
+    label: String,
     selected_port: String,
     selected_baud: u32,
     baud_input: String,
@@ -89,6 +91,132 @@ pub struct UartTermApp {
     flow_control: serialport::FlowControl,
     connection: Option<SerialHandle>,
     connected: bool,
+    dtr_state: bool,
+    rts_state: bool,
+    parser: StreamParser,
+}
+
+impl SerialConn {
+    fn new(label: &str, default_port: &str, delimiter: Vec<u8>) -> Self {
+        Self {
+            label: label.to_string(),
+            selected_port: default_port.to_string(),
+            selected_baud: 921600,
+            baud_input: "921600".to_string(),
+            data_bits: serialport::DataBits::Eight,
+            parity: serialport::Parity::None,
+            stop_bits: serialport::StopBits::One,
+            flow_control: serialport::FlowControl::None,
+            connection: None,
+            connected: false,
+            dtr_state: false,
+            rts_state: false,
+            parser: StreamParser::new(delimiter),
+        }
+    }
+
+    fn connect(&mut self, delimiter_input: &str) -> Result<String, String> {
+        match SerialHandle::connect(
+            &self.selected_port,
+            self.selected_baud,
+            self.data_bits,
+            self.parity,
+            self.stop_bits,
+            self.flow_control,
+        ) {
+            Ok(handle) => {
+                self.connection = Some(handle);
+                self.connected = true;
+                // Reset parser with current delimiter
+                if let Ok(delim) = parser::parse_hex_string(delimiter_input) {
+                    self.parser = StreamParser::new(delim);
+                } else {
+                    self.parser = StreamParser::new(vec![0xB5, 0x62]);
+                }
+                Ok(format!(
+                    "{}: {} @ {}",
+                    self.label, self.selected_port, self.selected_baud
+                ))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn disconnect(&mut self) -> Option<Packet> {
+        if let Some(handle) = self.connection.take() {
+            handle.disconnect();
+        }
+        self.connected = false;
+        self.parser.flush()
+    }
+
+    /// Poll serial handle, push packets into shared vec, log them.
+    /// Returns an error/status message if something happened.
+    fn poll(&mut self, packets: &mut Vec<Packet>, logger: &mut Option<Logger>) -> Option<String> {
+        if self.connection.is_none() {
+            return None;
+        }
+
+        let mut new_packets = Vec::new();
+        let mut error_msg = None;
+        let mut lost_connection = false;
+
+        if let Some(ref handle) = self.connection {
+            while let Ok(msg) = handle.rx.try_recv() {
+                match msg {
+                    SerialMsg::Data(data) => {
+                        let pkts = self.parser.feed(&data);
+                        new_packets.extend(pkts);
+                    }
+                    SerialMsg::Error(e) => {
+                        error_msg = Some(format!("{}: Error: {}", self.label, e));
+                    }
+                    SerialMsg::Disconnected => {
+                        lost_connection = true;
+                        error_msg =
+                            Some(format!("{}: Disconnected (device lost)", self.label));
+                        break;
+                    }
+                }
+            }
+        }
+
+        if lost_connection {
+            self.connected = false;
+            self.connection = None;
+        }
+
+        // Set source on all new packets
+        let source = short_port_name(&self.selected_port);
+        for pkt in &mut new_packets {
+            pkt.source = Some(source.clone());
+        }
+
+        // Log
+        for pkt in &new_packets {
+            if let Some(ref mut l) = logger {
+                l.log_packet(pkt);
+            }
+        }
+        if !new_packets.is_empty() {
+            if let Some(ref mut l) = logger {
+                l.flush();
+            }
+        }
+        packets.extend(new_packets);
+
+        error_msg
+    }
+}
+
+pub struct UartTermApp {
+    // Transport
+    transport_mode: TransportMode,
+
+    // Serial connections (two simultaneous)
+    serial: [SerialConn; 2],
+    send_target: usize,
+    available_ports: Vec<String>,
     status_msg: String,
 
     // BLE
@@ -103,7 +231,7 @@ pub struct UartTermApp {
     ble_notify_idx: usize,
     ble_write_idx: usize,
 
-    // Parser
+    // BLE parser (serial parsers are per-connection)
     parser: StreamParser,
     delimiter_input: String,
 
@@ -121,10 +249,6 @@ pub struct UartTermApp {
     send_history: Vec<String>,
     send_history_idx: Option<usize>,
 
-    // Control lines
-    dtr_state: bool,
-    rts_state: bool,
-
     // Logging
     log_enabled: bool,
     log_format: LogFormat,
@@ -136,21 +260,18 @@ pub struct UartTermApp {
 impl UartTermApp {
     pub fn new() -> Self {
         let ports = serial::list_ports();
-        let selected = ports.first().cloned().unwrap_or_default();
+        let default_port = ports.first().cloned().unwrap_or_default();
+        let default_delim = vec![0xB5, 0x62];
 
         Self {
             transport_mode: TransportMode::Serial,
 
+            serial: [
+                SerialConn::new("UART1", &default_port, default_delim.clone()),
+                SerialConn::new("UART2", &default_port, default_delim.clone()),
+            ],
+            send_target: 0,
             available_ports: ports,
-            selected_port: selected,
-            selected_baud: 921600,
-            baud_input: "921600".to_string(),
-            data_bits: serialport::DataBits::Eight,
-            parity: serialport::Parity::None,
-            stop_bits: serialport::StopBits::One,
-            flow_control: serialport::FlowControl::None,
-            connection: None,
-            connected: false,
             status_msg: "Disconnected".to_string(),
 
             ble_handle: None,
@@ -164,7 +285,7 @@ impl UartTermApp {
             ble_notify_idx: 0,
             ble_write_idx: 0,
 
-            parser: StreamParser::new(vec![0xB5, 0x62]),
+            parser: StreamParser::new(default_delim),
             delimiter_input: "B5 62".to_string(),
 
             display_format: DataFormat::HexAscii,
@@ -179,9 +300,6 @@ impl UartTermApp {
             send_history: Vec::new(),
             send_history_idx: None,
 
-            dtr_state: false,
-            rts_state: false,
-
             log_enabled: true,
             log_format: LogFormat::Hex,
             log_path: Self::make_log_path(),
@@ -191,7 +309,9 @@ impl UartTermApp {
     }
 
     fn make_log_path() -> String {
-        chrono::Local::now().format("log_%Y-%m-%d_%H-%M-%S.txt").to_string()
+        chrono::Local::now()
+            .format("log_%Y-%m-%d_%H-%M-%S.txt")
+            .to_string()
     }
 
     fn start_logger(&mut self) {
@@ -206,34 +326,21 @@ impl UartTermApp {
 
     fn is_connected(&self) -> bool {
         match self.transport_mode {
-            TransportMode::Serial => self.connected,
+            TransportMode::Serial => self.serial[0].connected || self.serial[1].connected,
             TransportMode::Ble => self.ble_connected,
         }
     }
 
     // --- Serial ---
 
-    fn connect(&mut self) {
-        match SerialHandle::connect(
-            &self.selected_port,
-            self.selected_baud,
-            self.data_bits,
-            self.parity,
-            self.stop_bits,
-            self.flow_control,
-        ) {
-            Ok(handle) => {
-                self.connection = Some(handle);
-                self.connected = true;
-                self.status_msg =
-                    format!("Connected: {} @ {}", self.selected_port, self.selected_baud);
-                // Reset parser
-                if let Ok(delim) = parser::parse_hex_string(&self.delimiter_input) {
-                    self.parser = StreamParser::new(delim);
-                } else {
-                    self.parser = StreamParser::new(vec![0xB5, 0x62]);
+    fn serial_connect(&mut self, idx: usize) {
+        let delimiter_input = self.delimiter_input.clone();
+        match self.serial[idx].connect(&delimiter_input) {
+            Ok(msg) => {
+                self.status_msg = msg;
+                if self.logger.is_none() {
+                    self.start_logger();
                 }
-                self.start_logger();
             }
             Err(e) => {
                 self.status_msg = e;
@@ -241,69 +348,53 @@ impl UartTermApp {
         }
     }
 
-    fn disconnect(&mut self) {
-        if let Some(handle) = self.connection.take() {
-            handle.disconnect();
-        }
-        self.connected = false;
-        self.status_msg = "Disconnected".to_string();
-        // Flush remaining parser data
-        if let Some(pkt) = self.parser.flush() {
+    fn serial_disconnect(&mut self, idx: usize) {
+        if let Some(mut pkt) = self.serial[idx].disconnect() {
+            pkt.source = Some(short_port_name(&self.serial[idx].selected_port));
             if let Some(ref mut logger) = self.logger {
                 logger.log_packet(&pkt);
                 logger.flush();
             }
             self.packets.push(pkt);
         }
+        // Update status
+        let any_connected = self.serial[0].connected || self.serial[1].connected;
+        if !any_connected {
+            self.status_msg = "Disconnected".to_string();
+        } else {
+            for conn in &self.serial {
+                if conn.connected {
+                    self.status_msg = format!(
+                        "{}: {} @ {}",
+                        conn.label, conn.selected_port, conn.selected_baud
+                    );
+                    break;
+                }
+            }
+        }
     }
 
     fn scan_ports(&mut self) {
         self.available_ports = serial::list_ports();
-        if !self.available_ports.contains(&self.selected_port) {
-            self.selected_port = self.available_ports.first().cloned().unwrap_or_default();
+        let ports = self.available_ports.clone();
+        for conn in &mut self.serial {
+            if !ports.contains(&conn.selected_port) {
+                conn.selected_port = ports.first().cloned().unwrap_or_default();
+            }
         }
     }
 
     fn poll_serial(&mut self) {
-        if let Some(ref handle) = self.connection {
-            let mut new_packets = Vec::new();
-            // Drain all available messages
-            while let Ok(msg) = handle.rx.try_recv() {
-                match msg {
-                    SerialMsg::Data(data) => {
-                        let pkts = self.parser.feed(&data);
-                        new_packets.extend(pkts);
-                    }
-                    SerialMsg::Error(e) => {
-                        self.status_msg = format!("Error: {}", e);
-                    }
-                    SerialMsg::Disconnected => {
-                        self.connected = false;
-                        self.status_msg = "Disconnected (device lost)".to_string();
-                        self.connection = None;
-                        break;
-                    }
-                }
+        for i in 0..2 {
+            if let Some(err) = self.serial[i].poll(&mut self.packets, &mut self.logger) {
+                self.status_msg = err;
             }
+        }
 
-            // Log and store
-            for pkt in &new_packets {
-                if let Some(ref mut logger) = self.logger {
-                    logger.log_packet(pkt);
-                }
-            }
-            if !new_packets.is_empty() {
-                if let Some(ref mut logger) = self.logger {
-                    logger.flush();
-                }
-            }
-            self.packets.extend(new_packets);
-
-            // Cap packets
-            if self.packets.len() > self.max_packets {
-                let drain = self.packets.len() - self.max_packets;
-                self.packets.drain(..drain);
-            }
+        // Cap packets
+        if self.packets.len() > self.max_packets {
+            let drain = self.packets.len() - self.max_packets;
+            self.packets.drain(..drain);
         }
     }
 
@@ -369,7 +460,8 @@ impl UartTermApp {
         self.ble_write_idx = 0;
         self.status_msg = "Disconnected".to_string();
         // Flush remaining parser data
-        if let Some(pkt) = self.parser.flush() {
+        if let Some(mut pkt) = self.parser.flush() {
+            pkt.source = Some("BLE".to_string());
             if let Some(ref mut logger) = self.logger {
                 logger.log_packet(&pkt);
                 logger.flush();
@@ -427,14 +519,15 @@ impl UartTermApp {
                         }
 
                         if auto_notify.is_some() || auto_write.is_some() {
-                            self.status_msg = format!(
-                                "{} | NUS detected",
-                                self.status_msg
-                            );
+                            self.status_msg =
+                                format!("{} | NUS detected", self.status_msg);
                         }
                     }
                     BleMsg::Data(data) => {
-                        let pkts = self.parser.feed(&data);
+                        let mut pkts = self.parser.feed(&data);
+                        for pkt in &mut pkts {
+                            pkt.source = Some("BLE".to_string());
+                        }
                         for pkt in &pkts {
                             if let Some(ref mut logger) = self.logger {
                                 logger.log_packet(pkt);
@@ -489,14 +582,19 @@ impl UartTermApp {
 
                 match self.transport_mode {
                     TransportMode::Serial => {
-                        if let Some(ref mut handle) = self.connection {
+                        let target = self.send_target;
+                        if let Some(ref mut handle) = self.serial[target].connection {
                             match handle.send(&bytes) {
                                 Ok(()) => {
+                                    let source = short_port_name(
+                                        &self.serial[target].selected_port,
+                                    );
                                     let pkt = Packet {
-                                        timestamp: self.parser.elapsed(),
+                                        timestamp: self.serial[target].parser.elapsed(),
                                         direction: Direction::Tx,
                                         data: bytes,
                                         label: None,
+                                        source: Some(source),
                                     };
                                     if let Some(ref mut logger) = self.logger {
                                         logger.log_packet(&pkt);
@@ -521,6 +619,7 @@ impl UartTermApp {
                                         direction: Direction::Tx,
                                         data: bytes,
                                         label: None,
+                                        source: Some("BLE".to_string()),
                                     };
                                     if let Some(ref mut logger) = self.logger {
                                         logger.log_packet(&pkt);
@@ -555,10 +654,17 @@ impl UartTermApp {
             ui.separator();
 
             match self.transport_mode {
-                TransportMode::Serial => self.draw_serial_toolbar(ui),
+                TransportMode::Serial => self.draw_serial_toolbar(ui, 0),
                 TransportMode::Ble => self.draw_ble_toolbar(ui),
             }
         });
+
+        // Second serial toolbar row (only in Serial mode)
+        if self.transport_mode == TransportMode::Serial {
+            ui.horizontal_wrapped(|ui| {
+                self.draw_serial_toolbar(ui, 1);
+            });
+        }
 
         ui.horizontal_wrapped(|ui| {
             ui.label("Delimiter:");
@@ -570,7 +676,10 @@ impl UartTermApp {
             if resp.changed() {
                 self.delimiter_input = format_hex_input(&self.delimiter_input);
                 if let Ok(delim) = parser::parse_hex_string(&self.delimiter_input) {
-                    self.parser.set_delimiter(delim);
+                    self.parser.set_delimiter(delim.clone());
+                    for conn in &mut self.serial {
+                        conn.parser.set_delimiter(delim.clone());
+                    }
                 }
             }
 
@@ -638,20 +747,29 @@ impl UartTermApp {
         });
     }
 
-    fn draw_serial_toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.label("Port:");
+    fn draw_serial_toolbar(&mut self, ui: &mut egui::Ui, idx: usize) {
+        let salt = format!("s{}", idx);
 
-        let port_text = if self.selected_port.is_empty() {
+        // Label
+        ui.label(egui::RichText::new(&self.serial[idx].label).strong());
+
+        // Port combo
+        let port_text = if self.serial[idx].selected_port.is_empty() {
             "---".to_string()
         } else {
-            self.selected_port.clone()
+            self.serial[idx].selected_port.clone()
         };
 
-        egui::ComboBox::from_id_salt("port_combo")
+        let ports = self.available_ports.clone();
+        egui::ComboBox::from_id_salt(format!("{}_port", salt))
             .selected_text(&port_text)
             .show_ui(ui, |ui| {
-                for port in &self.available_ports.clone() {
-                    ui.selectable_value(&mut self.selected_port, port.clone(), port);
+                for port in &ports {
+                    ui.selectable_value(
+                        &mut self.serial[idx].selected_port,
+                        port.clone(),
+                        port,
+                    );
                 }
             });
 
@@ -662,99 +780,139 @@ impl UartTermApp {
         ui.separator();
         ui.label("Baud:");
 
-        egui::ComboBox::from_id_salt("baud_combo")
-            .selected_text(self.selected_baud.to_string())
+        egui::ComboBox::from_id_salt(format!("{}_baud", salt))
+            .selected_text(self.serial[idx].selected_baud.to_string())
             .show_ui(ui, |ui| {
                 for &rate in BAUD_RATES {
                     if ui
-                        .selectable_value(&mut self.selected_baud, rate, rate.to_string())
+                        .selectable_value(
+                            &mut self.serial[idx].selected_baud,
+                            rate,
+                            rate.to_string(),
+                        )
                         .clicked()
                     {
-                        self.baud_input = rate.to_string();
+                        self.serial[idx].baud_input = rate.to_string();
                     }
                 }
             });
 
         let baud_resp = ui.add(
-            egui::TextEdit::singleline(&mut self.baud_input)
+            egui::TextEdit::singleline(&mut self.serial[idx].baud_input)
                 .desired_width(70.0)
                 .hint_text("custom"),
         );
         if baud_resp.changed() {
-            if let Ok(val) = self.baud_input.trim().parse::<u32>() {
-                self.selected_baud = val;
+            if let Ok(val) = self.serial[idx].baud_input.trim().parse::<u32>() {
+                self.serial[idx].selected_baud = val;
             }
         }
 
         ui.separator();
 
         // Data bits
-        let db_label = match self.data_bits {
+        let db_label = match self.serial[idx].data_bits {
             serialport::DataBits::Five => "5",
             serialport::DataBits::Six => "6",
             serialport::DataBits::Seven => "7",
             serialport::DataBits::Eight => "8",
         };
-        egui::ComboBox::from_id_salt("db_combo")
+        egui::ComboBox::from_id_salt(format!("{}_db", salt))
             .selected_text(db_label)
             .width(32.0)
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut self.data_bits, serialport::DataBits::Five, "5");
-                ui.selectable_value(&mut self.data_bits, serialport::DataBits::Six, "6");
-                ui.selectable_value(&mut self.data_bits, serialport::DataBits::Seven, "7");
-                ui.selectable_value(&mut self.data_bits, serialport::DataBits::Eight, "8");
+                ui.selectable_value(
+                    &mut self.serial[idx].data_bits,
+                    serialport::DataBits::Five,
+                    "5",
+                );
+                ui.selectable_value(
+                    &mut self.serial[idx].data_bits,
+                    serialport::DataBits::Six,
+                    "6",
+                );
+                ui.selectable_value(
+                    &mut self.serial[idx].data_bits,
+                    serialport::DataBits::Seven,
+                    "7",
+                );
+                ui.selectable_value(
+                    &mut self.serial[idx].data_bits,
+                    serialport::DataBits::Eight,
+                    "8",
+                );
             });
 
         // Parity
-        let par_label = match self.parity {
+        let par_label = match self.serial[idx].parity {
             serialport::Parity::None => "N",
             serialport::Parity::Odd => "O",
             serialport::Parity::Even => "E",
         };
-        egui::ComboBox::from_id_salt("par_combo")
+        egui::ComboBox::from_id_salt(format!("{}_par", salt))
             .selected_text(par_label)
             .width(32.0)
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut self.parity, serialport::Parity::None, "None");
-                ui.selectable_value(&mut self.parity, serialport::Parity::Odd, "Odd");
-                ui.selectable_value(&mut self.parity, serialport::Parity::Even, "Even");
+                ui.selectable_value(
+                    &mut self.serial[idx].parity,
+                    serialport::Parity::None,
+                    "None",
+                );
+                ui.selectable_value(
+                    &mut self.serial[idx].parity,
+                    serialport::Parity::Odd,
+                    "Odd",
+                );
+                ui.selectable_value(
+                    &mut self.serial[idx].parity,
+                    serialport::Parity::Even,
+                    "Even",
+                );
             });
 
         // Stop bits
-        let sb_label = match self.stop_bits {
+        let sb_label = match self.serial[idx].stop_bits {
             serialport::StopBits::One => "1",
             serialport::StopBits::Two => "2",
         };
-        egui::ComboBox::from_id_salt("sb_combo")
+        egui::ComboBox::from_id_salt(format!("{}_sb", salt))
             .selected_text(sb_label)
             .width(32.0)
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut self.stop_bits, serialport::StopBits::One, "1");
-                ui.selectable_value(&mut self.stop_bits, serialport::StopBits::Two, "2");
+                ui.selectable_value(
+                    &mut self.serial[idx].stop_bits,
+                    serialport::StopBits::One,
+                    "1",
+                );
+                ui.selectable_value(
+                    &mut self.serial[idx].stop_bits,
+                    serialport::StopBits::Two,
+                    "2",
+                );
             });
 
         // Flow control
-        let fc_label = match self.flow_control {
+        let fc_label = match self.serial[idx].flow_control {
             serialport::FlowControl::None => "Off",
             serialport::FlowControl::Software => "XON",
             serialport::FlowControl::Hardware => "RTS",
         };
-        egui::ComboBox::from_id_salt("fc_combo")
+        egui::ComboBox::from_id_salt(format!("{}_fc", salt))
             .selected_text(fc_label)
             .width(40.0)
             .show_ui(ui, |ui| {
                 ui.selectable_value(
-                    &mut self.flow_control,
+                    &mut self.serial[idx].flow_control,
                     serialport::FlowControl::None,
                     "Off",
                 );
                 ui.selectable_value(
-                    &mut self.flow_control,
+                    &mut self.serial[idx].flow_control,
                     serialport::FlowControl::Software,
                     "XON/XOFF",
                 );
                 ui.selectable_value(
-                    &mut self.flow_control,
+                    &mut self.serial[idx].flow_control,
                     serialport::FlowControl::Hardware,
                     "RTS/CTS",
                 );
@@ -762,7 +920,8 @@ impl UartTermApp {
 
         ui.separator();
 
-        if self.connected {
+        // Connect / Disconnect
+        if self.serial[idx].connected {
             if ui
                 .button(
                     egui::RichText::new("Disconnect")
@@ -770,7 +929,7 @@ impl UartTermApp {
                 )
                 .clicked()
             {
-                self.disconnect();
+                self.serial_disconnect(idx);
             }
         } else if ui
             .button(
@@ -778,7 +937,7 @@ impl UartTermApp {
             )
             .clicked()
         {
-            self.connect();
+            self.serial_connect(idx);
         }
 
         ui.separator();
@@ -786,28 +945,28 @@ impl UartTermApp {
         // DTR / RTS toggles
         if ui
             .add_enabled(
-                self.connected,
-                egui::Button::new("DTR").selected(self.dtr_state),
+                self.serial[idx].connected,
+                egui::Button::new("DTR").selected(self.serial[idx].dtr_state),
             )
             .clicked()
         {
-            self.dtr_state = !self.dtr_state;
-            if let Some(ref mut handle) = self.connection {
-                if let Err(e) = handle.set_dtr(self.dtr_state) {
+            self.serial[idx].dtr_state = !self.serial[idx].dtr_state;
+            if let Some(ref mut handle) = self.serial[idx].connection {
+                if let Err(e) = handle.set_dtr(self.serial[idx].dtr_state) {
                     self.status_msg = e;
                 }
             }
         }
         if ui
             .add_enabled(
-                self.connected,
-                egui::Button::new("RTS").selected(self.rts_state),
+                self.serial[idx].connected,
+                egui::Button::new("RTS").selected(self.serial[idx].rts_state),
             )
             .clicked()
         {
-            self.rts_state = !self.rts_state;
-            if let Some(ref mut handle) = self.connection {
-                if let Err(e) = handle.set_rts(self.rts_state) {
+            self.serial[idx].rts_state = !self.serial[idx].rts_state;
+            if let Some(ref mut handle) = self.serial[idx].connection {
+                if let Err(e) = handle.set_rts(self.serial[idx].rts_state) {
                     self.status_msg = e;
                 }
             }
@@ -992,6 +1151,7 @@ impl UartTermApp {
         let ts_color = egui::Color32::from_rgb(140, 140, 140); // grey
         let label_color = egui::Color32::from_rgb(120, 180, 255); // light blue
         let ascii_color = egui::Color32::from_rgb(180, 160, 200); // muted purple
+        let source_color = egui::Color32::from_rgb(100, 200, 200); // teal
 
         let mono = egui::FontId::monospace(13.0);
 
@@ -1022,6 +1182,11 @@ impl UartTermApp {
                         font_id: mono.clone(),
                         ..Default::default()
                     };
+
+                    // Source (port name)
+                    if let Some(ref source) = pkt.source {
+                        job.append(&format!("{} ", source), 0.0, fmt(source_color));
+                    }
 
                     // Arrow
                     job.append(arrow, 0.0, fmt(dir_color));
@@ -1069,8 +1234,13 @@ impl UartTermApp {
     }
 
     fn draw_send_bar(&mut self, ui: &mut egui::Ui) {
-        // Right-side buttons width: LineEnding(~75) + Send(~45) + Clear(~50) + Auto-scroll(~85) + Display(~110) + gaps(~60)
-        let right_width = 430.0;
+        // Right-side buttons width: Target(~90) + LineEnding(~75) + Send(~45) + Clear(~50) + Auto-scroll(~85) + Display(~110) + gaps(~65)
+        let target_width = if self.transport_mode == TransportMode::Serial {
+            90.0
+        } else {
+            0.0
+        };
+        let right_width = 430.0 + target_width;
 
         ui.horizontal(|ui| {
             ui.label("HEX:");
@@ -1115,7 +1285,21 @@ impl UartTermApp {
                 self.send_history_idx = None;
             }
 
-            // Line ending — right after input
+            // Target port selector (Serial mode only)
+            if self.transport_mode == TransportMode::Serial {
+                let target_label = &self.serial[self.send_target].label;
+                egui::ComboBox::from_id_salt("send_target_combo")
+                    .selected_text(target_label.as_str())
+                    .width(55.0)
+                    .show_ui(ui, |ui| {
+                        for i in 0..2 {
+                            let lbl = self.serial[i].label.clone();
+                            ui.selectable_value(&mut self.send_target, i, &lbl);
+                        }
+                    });
+            }
+
+            // Line ending
             egui::ComboBox::from_id_salt("le_combo")
                 .selected_text(self.line_ending.label())
                 .width(45.0)
@@ -1165,7 +1349,11 @@ impl UartTermApp {
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut self.display_format, DataFormat::Hex, "HEX");
                     ui.selectable_value(&mut self.display_format, DataFormat::Ascii, "ASCII");
-                    ui.selectable_value(&mut self.display_format, DataFormat::HexAscii, "HEX+ASCII");
+                    ui.selectable_value(
+                        &mut self.display_format,
+                        DataFormat::HexAscii,
+                        "HEX+ASCII",
+                    );
                 });
         });
     }
@@ -1191,7 +1379,8 @@ impl eframe::App for UartTermApp {
         }
 
         // Request repaint while connected, scanning, or dialog pending
-        if self.is_connected() || self.ble_scanning || self.file_dialog_rx.is_some() {
+        let any_serial = self.serial[0].connected || self.serial[1].connected;
+        if any_serial || self.ble_connected || self.ble_scanning || self.file_dialog_rx.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
 

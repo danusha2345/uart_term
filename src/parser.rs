@@ -12,6 +12,7 @@ pub struct Packet {
     pub direction: Direction,
     pub data: Vec<u8>,
     pub label: Option<String>,
+    pub source: Option<String>,
 }
 
 impl Packet {
@@ -133,6 +134,7 @@ impl StreamParser {
                             direction: Direction::Rx,
                             data: packet_data,
                             label,
+                            source: None,
                         });
                     }
 
@@ -157,6 +159,7 @@ impl StreamParser {
             direction: Direction::Rx,
             data,
             label,
+            source: None,
         })
     }
 

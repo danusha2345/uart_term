@@ -31,27 +31,31 @@ impl Logger {
             Direction::Tx => ">",
         };
         let label = packet.label.as_deref().unwrap_or("");
+        let source_prefix = match packet.source {
+            Some(ref s) => format!("{} ", s),
+            None => String::new(),
+        };
 
         match self.format {
             LogFormat::Hex => {
                 let _ = writeln!(
                     self.file,
-                    "{} {:.3}s {} {}",
-                    dir, packet.timestamp, packet.hex_string(), label
+                    "{}{} {:.3}s {} {}",
+                    source_prefix, dir, packet.timestamp, packet.hex_string(), label
                 );
             }
             LogFormat::Ascii => {
                 let _ = writeln!(
                     self.file,
-                    "{} {:.3}s {} {}",
-                    dir, packet.timestamp, packet.ascii_string(), label
+                    "{}{} {:.3}s {} {}",
+                    source_prefix, dir, packet.timestamp, packet.ascii_string(), label
                 );
             }
             LogFormat::HexAscii => {
                 let _ = writeln!(
                     self.file,
-                    "{} {:.3}s {} |{}| {}",
-                    dir, packet.timestamp, packet.hex_string(), packet.ascii_string(), label
+                    "{}{} {:.3}s {} |{}| {}",
+                    source_prefix, dir, packet.timestamp, packet.hex_string(), packet.ascii_string(), label
                 );
             }
         }
