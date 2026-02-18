@@ -1254,9 +1254,8 @@ impl UartTermApp {
             .collect();
 
         let row_height = 18.0;
-        egui::ScrollArea::vertical()
+        let output = egui::ScrollArea::vertical()
             .auto_shrink([false; 2])
-            .stick_to_bottom(self.auto_scroll)
             .show_rows(ui, row_height, filtered.len(), |ui, range| {
                 for pkt in &filtered[range] {
                     let (dir_color, arrow) = match pkt.direction {
@@ -1320,6 +1319,20 @@ impl UartTermApp {
                     });
                 }
             });
+
+        // Smooth animated auto-scroll instead of instant stick_to_bottom
+        if self.auto_scroll && !filtered.is_empty() {
+            let max_offset = (output.content_size.y - output.inner_rect.height()).max(0.0);
+            let smoothed = ui.ctx().animate_value_with_time(
+                output.id.with("auto_scroll_y"),
+                max_offset,
+                0.15,
+            );
+            // Clamp: never exceed max_offset (prevents blank space on window resize)
+            let mut state = output.state;
+            state.offset.y = smoothed.min(max_offset);
+            state.store(ui.ctx(), output.id);
+        }
     }
 
     fn draw_send_bar(&mut self, ui: &mut egui::Ui) {
