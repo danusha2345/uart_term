@@ -183,6 +183,10 @@ impl SerialConn {
 
         if lost_connection {
             self.connection = None;
+            // Flush parser buffer as partial packet
+            if let Some(pkt) = self.parser.flush() {
+                new_packets.push(pkt);
+            }
         }
 
         // Set source on all new packets
@@ -476,6 +480,15 @@ impl UartTermApp {
                         self.status_msg = format!("BLE Connected: {}", name);
                     }
                     BleMsg::Disconnected => {
+                        // Flush parser buffer as partial packet
+                        if let Some(mut pkt) = self.parser.flush() {
+                            pkt.source = Some("BLE".to_string());
+                            if let Some(ref mut logger) = self.logger {
+                                logger.log_packet(&pkt);
+                                logger.flush();
+                            }
+                            self.packets.push(pkt);
+                        }
                         self.ble_connected = false;
                         self.ble_chars.clear();
                         self.ble_notify_char = None;
@@ -543,10 +556,7 @@ impl UartTermApp {
 
     fn poll_transport(&mut self) {
         self.poll_ble_events();
-        match self.transport_mode {
-            TransportMode::Serial => self.poll_serial(),
-            TransportMode::Ble => {} // BLE data handled in poll_ble_events
-        }
+        self.poll_serial(); // Always poll serial, even in BLE mode
 
         // Check logger errors
         if let Some(ref mut logger) = self.logger {
@@ -589,13 +599,13 @@ impl UartTermApp {
                                     let source = short_port_name(
                                         &self.serial[target].selected_port,
                                     );
-                                    let pkt = Packet {
-                                        timestamp: self.serial[target].parser.elapsed(),
-                                        direction: Direction::Tx,
-                                        data: bytes,
-                                        label: None,
-                                        source: Some(source),
-                                    };
+                                    let pkt = Packet::new(
+                                        self.serial[target].parser.elapsed(),
+                                        Direction::Tx,
+                                        bytes,
+                                        None,
+                                        Some(source),
+                                    );
                                     if let Some(ref mut logger) = self.logger {
                                         logger.log_packet(&pkt);
                                         logger.flush();
@@ -614,13 +624,13 @@ impl UartTermApp {
                         {
                             match handle.send(svc, chr, &bytes) {
                                 Ok(()) => {
-                                    let pkt = Packet {
-                                        timestamp: self.parser.elapsed(),
-                                        direction: Direction::Tx,
-                                        data: bytes,
-                                        label: None,
-                                        source: Some("BLE".to_string()),
-                                    };
+                                    let pkt = Packet::new(
+                                        self.parser.elapsed(),
+                                        Direction::Tx,
+                                        bytes,
+                                        None,
+                                        Some("BLE".to_string()),
+                                    );
                                     if let Some(ref mut logger) = self.logger {
                                         logger.log_packet(&pkt);
                                         logger.flush();
@@ -841,7 +851,9 @@ impl UartTermApp {
                     serialport::DataBits::Eight,
                     "8",
                 );
-            });
+            })
+            .response
+            .on_hover_text("Data bits");
 
         // Parity
         let par_label = match self.serial[idx].parity {
@@ -868,7 +880,9 @@ impl UartTermApp {
                     serialport::Parity::Even,
                     "Even",
                 );
-            });
+            })
+            .response
+            .on_hover_text("Parity");
 
         // Stop bits
         let sb_label = match self.serial[idx].stop_bits {
@@ -889,7 +903,9 @@ impl UartTermApp {
                     serialport::StopBits::Two,
                     "2",
                 );
-            });
+            })
+            .response
+            .on_hover_text("Stop bits");
 
         // Flow control
         let fc_label = match self.serial[idx].flow_control {
@@ -916,7 +932,9 @@ impl UartTermApp {
                     serialport::FlowControl::Hardware,
                     "RTS/CTS",
                 );
-            });
+            })
+            .response
+            .on_hover_text("Flow control");
 
         ui.separator();
 
@@ -931,13 +949,20 @@ impl UartTermApp {
             {
                 self.serial_disconnect(idx);
             }
-        } else if ui
-            .button(
-                egui::RichText::new("Connect").color(egui::Color32::from_rgb(100, 255, 100)),
-            )
-            .clicked()
-        {
-            self.serial_connect(idx);
+        } else {
+            let can_connect = !self.serial[idx].selected_port.is_empty();
+            if ui
+                .add_enabled(
+                    can_connect,
+                    egui::Button::new(
+                        egui::RichText::new("Connect")
+                            .color(egui::Color32::from_rgb(100, 255, 100)),
+                    ),
+                )
+                .clicked()
+            {
+                self.serial_connect(idx);
+            }
         }
 
         ui.separator();
@@ -948,6 +973,7 @@ impl UartTermApp {
                 self.serial[idx].is_connected(),
                 egui::Button::new("DTR").selected(self.serial[idx].dtr_state),
             )
+            .on_hover_text("Data Terminal Ready")
             .clicked()
         {
             self.serial[idx].dtr_state = !self.serial[idx].dtr_state;
@@ -962,6 +988,7 @@ impl UartTermApp {
                 self.serial[idx].is_connected(),
                 egui::Button::new("RTS").selected(self.serial[idx].rts_state),
             )
+            .on_hover_text("Request To Send")
             .clicked()
         {
             self.serial[idx].rts_state = !self.serial[idx].rts_state;
@@ -1076,35 +1103,6 @@ impl UartTermApp {
                 .map(|(i, c)| (i, c.short_label()))
                 .collect();
 
-            if !notify_chars.is_empty() {
-                ui.label("RX:");
-                let current_label = notify_chars
-                    .iter()
-                    .find(|(i, _)| *i == self.ble_notify_idx)
-                    .map(|(_, l)| l.clone())
-                    .unwrap_or_else(|| "---".to_string());
-
-                let mut new_notify_idx = self.ble_notify_idx;
-                egui::ComboBox::from_id_salt("ble_rx_combo")
-                    .selected_text(&current_label)
-                    .width(100.0)
-                    .show_ui(ui, |ui| {
-                        for (i, label) in &notify_chars {
-                            ui.selectable_value(&mut new_notify_idx, *i, label);
-                        }
-                    });
-
-                if new_notify_idx != self.ble_notify_idx {
-                    self.ble_notify_idx = new_notify_idx;
-                    if let Some(c) = self.ble_chars.get(new_notify_idx) {
-                        self.ble_notify_char = Some((c.service_uuid, c.char_uuid));
-                        if let Some(ref h) = self.ble_handle {
-                            let _ = h.send_cmd(BleCmd::Subscribe(c.service_uuid, c.char_uuid));
-                        }
-                    }
-                }
-            }
-
             // TX (write) characteristic
             let write_chars: Vec<(usize, String)> = self
                 .ble_chars
@@ -1114,28 +1112,72 @@ impl UartTermApp {
                 .map(|(i, c)| (i, c.short_label()))
                 .collect();
 
-            if !write_chars.is_empty() {
-                ui.label("TX:");
-                let current_label = write_chars
-                    .iter()
-                    .find(|(i, _)| *i == self.ble_write_idx)
-                    .map(|(_, l)| l.clone())
-                    .unwrap_or_else(|| "---".to_string());
+            // If NUS auto-detected and only one choice each — just show label
+            let nus_auto = self.ble_notify_char.is_some()
+                && self.ble_write_char.is_some()
+                && notify_chars.len() == 1
+                && write_chars.len() == 1;
 
-                let mut new_write_idx = self.ble_write_idx;
-                egui::ComboBox::from_id_salt("ble_tx_combo")
-                    .selected_text(&current_label)
-                    .width(100.0)
-                    .show_ui(ui, |ui| {
-                        for (i, label) in &write_chars {
-                            ui.selectable_value(&mut new_write_idx, *i, label);
+            if nus_auto {
+                ui.label(
+                    egui::RichText::new("NUS")
+                        .color(egui::Color32::from_rgb(100, 200, 100)),
+                );
+            } else {
+                // Show comboboxes only when there is a real choice
+                if notify_chars.len() > 1 {
+                    ui.label("RX:");
+                    let current_label = notify_chars
+                        .iter()
+                        .find(|(i, _)| *i == self.ble_notify_idx)
+                        .map(|(_, l)| l.clone())
+                        .unwrap_or_else(|| "---".to_string());
+
+                    let mut new_notify_idx = self.ble_notify_idx;
+                    egui::ComboBox::from_id_salt("ble_rx_combo")
+                        .selected_text(&current_label)
+                        .width(100.0)
+                        .show_ui(ui, |ui| {
+                            for (i, label) in &notify_chars {
+                                ui.selectable_value(&mut new_notify_idx, *i, label);
+                            }
+                        });
+
+                    if new_notify_idx != self.ble_notify_idx {
+                        self.ble_notify_idx = new_notify_idx;
+                        if let Some(c) = self.ble_chars.get(new_notify_idx) {
+                            self.ble_notify_char = Some((c.service_uuid, c.char_uuid));
+                            if let Some(ref h) = self.ble_handle {
+                                let _ =
+                                    h.send_cmd(BleCmd::Subscribe(c.service_uuid, c.char_uuid));
+                            }
                         }
-                    });
+                    }
+                }
 
-                if new_write_idx != self.ble_write_idx {
-                    self.ble_write_idx = new_write_idx;
-                    if let Some(c) = self.ble_chars.get(new_write_idx) {
-                        self.ble_write_char = Some((c.service_uuid, c.char_uuid));
+                if write_chars.len() > 1 {
+                    ui.label("TX:");
+                    let current_label = write_chars
+                        .iter()
+                        .find(|(i, _)| *i == self.ble_write_idx)
+                        .map(|(_, l)| l.clone())
+                        .unwrap_or_else(|| "---".to_string());
+
+                    let mut new_write_idx = self.ble_write_idx;
+                    egui::ComboBox::from_id_salt("ble_tx_combo")
+                        .selected_text(&current_label)
+                        .width(100.0)
+                        .show_ui(ui, |ui| {
+                            for (i, label) in &write_chars {
+                                ui.selectable_value(&mut new_write_idx, *i, label);
+                            }
+                        });
+
+                    if new_write_idx != self.ble_write_idx {
+                        self.ble_write_idx = new_write_idx;
+                        if let Some(c) = self.ble_chars.get(new_write_idx) {
+                            self.ble_write_char = Some((c.service_uuid, c.char_uuid));
+                        }
                     }
                 }
             }
@@ -1152,25 +1194,27 @@ impl UartTermApp {
 
         let mono = egui::FontId::monospace(13.0);
 
+        // Pre-filter packets
+        let filtered: Vec<&Packet> = self
+            .packets
+            .iter()
+            .filter(|pkt| {
+                self.filter_bytes.is_empty()
+                    || pkt.direction == Direction::Tx
+                    || pkt.data.starts_with(&self.filter_bytes)
+            })
+            .collect();
+
+        let row_height = 18.0;
         egui::ScrollArea::vertical()
             .auto_shrink([false; 2])
             .stick_to_bottom(self.auto_scroll)
-            .show(ui, |ui| {
-                for pkt in &self.packets {
-                    // Apply display filter (TX always visible)
-                    if !self.filter_bytes.is_empty()
-                        && pkt.direction == Direction::Rx
-                        && !pkt.data.starts_with(&self.filter_bytes)
-                    {
-                        continue;
-                    }
-
+            .show_rows(ui, row_height, filtered.len(), |ui, range| {
+                for pkt in &filtered[range] {
                     let (dir_color, arrow) = match pkt.direction {
                         Direction::Rx => (rx_color, "< "),
                         Direction::Tx => (tx_color, "> "),
                     };
-
-                    let hex = pkt.hex_string();
 
                     let mut job = egui::text::LayoutJob::default();
 
@@ -1195,13 +1239,13 @@ impl UartTermApp {
                     // Data columns based on display format
                     match self.display_format {
                         DataFormat::Hex => {
-                            job.append(&hex, 0.0, fmt(dir_color));
+                            job.append(pkt.hex_string(), 0.0, fmt(dir_color));
                         }
                         DataFormat::Ascii => {
-                            job.append(&pkt.ascii_string(), 0.0, fmt(dir_color));
+                            job.append(pkt.ascii_string(), 0.0, fmt(dir_color));
                         }
                         DataFormat::HexAscii => {
-                            job.append(&hex, 0.0, fmt(dir_color));
+                            job.append(pkt.hex_string(), 0.0, fmt(dir_color));
                             job.append(
                                 &format!("  |{}|", pkt.ascii_string()),
                                 0.0,
@@ -1218,11 +1262,11 @@ impl UartTermApp {
                     let response = ui.label(job);
                     response.context_menu(|ui| {
                         if ui.button("Copy HEX").clicked() {
-                            ui.ctx().copy_text(pkt.hex_string());
+                            ui.ctx().copy_text(pkt.hex_string().to_string());
                             ui.close();
                         }
                         if ui.button("Copy ASCII").clicked() {
-                            ui.ctx().copy_text(pkt.ascii_string());
+                            ui.ctx().copy_text(pkt.ascii_string().to_string());
                             ui.close();
                         }
                     });
@@ -1375,9 +1419,10 @@ impl eframe::App for UartTermApp {
             }
         }
 
-        // Request repaint while connected, scanning, or dialog pending
+        // Request repaint while connected, scanning, connecting, or dialog pending
         let any_serial = self.serial[0].is_connected() || self.serial[1].is_connected();
-        if any_serial || self.ble_connected || self.ble_scanning || self.file_dialog_rx.is_some() {
+        let ble_active = self.ble_connected || self.ble_scanning || self.ble_handle.is_some();
+        if any_serial || ble_active || self.file_dialog_rx.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
 

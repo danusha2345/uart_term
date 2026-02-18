@@ -13,19 +13,25 @@ pub struct Packet {
     pub data: Vec<u8>,
     pub label: Option<String>,
     pub source: Option<String>,
+    pub hex: String,
+    pub ascii: String,
 }
 
 impl Packet {
-    pub fn hex_string(&self) -> String {
-        self.data
+    /// Create a new packet, pre-computing hex and ascii caches.
+    pub fn new(
+        timestamp: f64,
+        direction: Direction,
+        data: Vec<u8>,
+        label: Option<String>,
+        source: Option<String>,
+    ) -> Self {
+        let hex = data
             .iter()
             .map(|b| format!("{:02X}", b))
             .collect::<Vec<_>>()
-            .join(" ")
-    }
-
-    pub fn ascii_string(&self) -> String {
-        self.data
+            .join(" ");
+        let ascii = data
             .iter()
             .map(|&b| {
                 if b.is_ascii_graphic() || b == b' ' {
@@ -34,7 +40,24 @@ impl Packet {
                     '.'
                 }
             })
-            .collect()
+            .collect();
+        Self {
+            timestamp,
+            direction,
+            data,
+            label,
+            source,
+            hex,
+            ascii,
+        }
+    }
+
+    pub fn hex_string(&self) -> &str {
+        &self.hex
+    }
+
+    pub fn ascii_string(&self) -> &str {
+        &self.ascii
     }
 }
 
@@ -113,13 +136,13 @@ impl StreamParser {
             // Flush buffer as partial packet if it exceeds max size (OOM protection)
             if self.buffer.len() >= MAX_BUFFER_SIZE {
                 let data = std::mem::take(&mut self.buffer);
-                packets.push(Packet {
-                    timestamp: self.start_time.elapsed().as_secs_f64(),
-                    direction: Direction::Rx,
+                packets.push(Packet::new(
+                    self.start_time.elapsed().as_secs_f64(),
+                    Direction::Rx,
                     data,
-                    label: None,
-                    source: None,
-                });
+                    None,
+                    None,
+                ));
                 continue;
             }
 
@@ -134,13 +157,13 @@ impl StreamParser {
 
                     if !packet_data.is_empty() {
                         let label = ubx_label(&packet_data, &self.delimiter);
-                        packets.push(Packet {
-                            timestamp: self.start_time.elapsed().as_secs_f64(),
-                            direction: Direction::Rx,
-                            data: packet_data,
+                        packets.push(Packet::new(
+                            self.start_time.elapsed().as_secs_f64(),
+                            Direction::Rx,
+                            packet_data,
                             label,
-                            source: None,
-                        });
+                            None,
+                        ));
                     }
 
                     // Keep the delimiter as the start of the next packet
@@ -152,20 +175,22 @@ impl StreamParser {
         packets
     }
 
-    /// Flush any remaining data as a packet
+    /// Flush any remaining data as a packet.
+    /// Skips if buffer is empty or contains only the delimiter prefix.
     pub fn flush(&mut self) -> Option<Packet> {
-        if self.buffer.is_empty() {
+        if self.buffer.is_empty() || self.buffer == self.delimiter {
+            self.buffer.clear();
             return None;
         }
         let data = std::mem::take(&mut self.buffer);
         let label = ubx_label(&data, &self.delimiter);
-        Some(Packet {
-            timestamp: self.start_time.elapsed().as_secs_f64(),
-            direction: Direction::Rx,
+        Some(Packet::new(
+            self.start_time.elapsed().as_secs_f64(),
+            Direction::Rx,
             data,
             label,
-            source: None,
-        })
+            None,
+        ))
     }
 
     pub fn elapsed(&self) -> f64 {
