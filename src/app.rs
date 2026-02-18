@@ -90,13 +90,16 @@ struct SerialConn {
     stop_bits: serialport::StopBits,
     flow_control: serialport::FlowControl,
     connection: Option<SerialHandle>,
-    connected: bool,
     dtr_state: bool,
     rts_state: bool,
     parser: StreamParser,
 }
 
 impl SerialConn {
+    fn is_connected(&self) -> bool {
+        self.connection.is_some()
+    }
+
     fn new(label: &str, default_port: &str, delimiter: Vec<u8>) -> Self {
         Self {
             label: label.to_string(),
@@ -108,7 +111,6 @@ impl SerialConn {
             stop_bits: serialport::StopBits::One,
             flow_control: serialport::FlowControl::None,
             connection: None,
-            connected: false,
             dtr_state: false,
             rts_state: false,
             parser: StreamParser::new(delimiter),
@@ -126,7 +128,6 @@ impl SerialConn {
         ) {
             Ok(handle) => {
                 self.connection = Some(handle);
-                self.connected = true;
                 // Reset parser with current delimiter
                 if let Ok(delim) = parser::parse_hex_string(delimiter_input) {
                     self.parser = StreamParser::new(delim);
@@ -146,7 +147,6 @@ impl SerialConn {
         if let Some(handle) = self.connection.take() {
             handle.disconnect();
         }
-        self.connected = false;
         self.parser.flush()
     }
 
@@ -182,7 +182,6 @@ impl SerialConn {
         }
 
         if lost_connection {
-            self.connected = false;
             self.connection = None;
         }
 
@@ -326,7 +325,7 @@ impl UartTermApp {
 
     fn is_connected(&self) -> bool {
         match self.transport_mode {
-            TransportMode::Serial => self.serial[0].connected || self.serial[1].connected,
+            TransportMode::Serial => self.serial[0].is_connected() || self.serial[1].is_connected(),
             TransportMode::Ble => self.ble_connected,
         }
     }
@@ -358,12 +357,12 @@ impl UartTermApp {
             self.packets.push(pkt);
         }
         // Update status
-        let any_connected = self.serial[0].connected || self.serial[1].connected;
+        let any_connected = self.serial[0].is_connected() || self.serial[1].is_connected();
         if !any_connected {
             self.status_msg = "Disconnected".to_string();
         } else {
             for conn in &self.serial {
-                if conn.connected {
+                if conn.is_connected() {
                     self.status_msg = format!(
                         "{}: {} @ {}",
                         conn.label, conn.selected_port, conn.selected_baud
@@ -389,12 +388,6 @@ impl UartTermApp {
             if let Some(err) = self.serial[i].poll(&mut self.packets, &mut self.logger) {
                 self.status_msg = err;
             }
-        }
-
-        // Cap packets
-        if self.packets.len() > self.max_packets {
-            let drain = self.packets.len() - self.max_packets;
-            self.packets.drain(..drain);
         }
     }
 
@@ -539,12 +532,6 @@ impl UartTermApp {
                             }
                         }
                         self.packets.extend(pkts);
-
-                        // Cap packets
-                        if self.packets.len() > self.max_packets {
-                            let drain = self.packets.len() - self.max_packets;
-                            self.packets.drain(..drain);
-                        }
                     }
                     BleMsg::Error(e) => {
                         self.status_msg = format!("BLE: {}", e);
@@ -559,6 +546,19 @@ impl UartTermApp {
         match self.transport_mode {
             TransportMode::Serial => self.poll_serial(),
             TransportMode::Ble => {} // BLE data handled in poll_ble_events
+        }
+
+        // Check logger errors
+        if let Some(ref mut logger) = self.logger {
+            if let Some(err) = logger.last_error.take() {
+                self.status_msg = err;
+            }
+        }
+
+        // Cap packets
+        if self.packets.len() > self.max_packets {
+            let drain = self.packets.len() - self.max_packets;
+            self.packets.drain(..drain);
         }
     }
 
@@ -921,7 +921,7 @@ impl UartTermApp {
         ui.separator();
 
         // Connect / Disconnect
-        if self.serial[idx].connected {
+        if self.serial[idx].is_connected() {
             if ui
                 .button(
                     egui::RichText::new("Disconnect")
@@ -945,7 +945,7 @@ impl UartTermApp {
         // DTR / RTS toggles
         if ui
             .add_enabled(
-                self.serial[idx].connected,
+                self.serial[idx].is_connected(),
                 egui::Button::new("DTR").selected(self.serial[idx].dtr_state),
             )
             .clicked()
@@ -959,7 +959,7 @@ impl UartTermApp {
         }
         if ui
             .add_enabled(
-                self.serial[idx].connected,
+                self.serial[idx].is_connected(),
                 egui::Button::new("RTS").selected(self.serial[idx].rts_state),
             )
             .clicked()
@@ -1030,12 +1030,7 @@ impl UartTermApp {
                     } else {
                         format!("{} [{}]{}", dev.name, dev.address, rssi_str)
                     };
-                    if ui
-                        .selectable_value(&mut self.ble_selected_device, Some(i), &label)
-                        .clicked()
-                    {
-                        self.ble_selected_device = Some(i);
-                    }
+                    ui.selectable_value(&mut self.ble_selected_device, Some(i), &label);
                 }
             });
 
@@ -1101,10 +1096,11 @@ impl UartTermApp {
 
                 if new_notify_idx != self.ble_notify_idx {
                     self.ble_notify_idx = new_notify_idx;
-                    let c = &self.ble_chars[new_notify_idx];
-                    self.ble_notify_char = Some((c.service_uuid, c.char_uuid));
-                    if let Some(ref h) = self.ble_handle {
-                        let _ = h.send_cmd(BleCmd::Subscribe(c.service_uuid, c.char_uuid));
+                    if let Some(c) = self.ble_chars.get(new_notify_idx) {
+                        self.ble_notify_char = Some((c.service_uuid, c.char_uuid));
+                        if let Some(ref h) = self.ble_handle {
+                            let _ = h.send_cmd(BleCmd::Subscribe(c.service_uuid, c.char_uuid));
+                        }
                     }
                 }
             }
@@ -1138,8 +1134,9 @@ impl UartTermApp {
 
                 if new_write_idx != self.ble_write_idx {
                     self.ble_write_idx = new_write_idx;
-                    let c = &self.ble_chars[new_write_idx];
-                    self.ble_write_char = Some((c.service_uuid, c.char_uuid));
+                    if let Some(c) = self.ble_chars.get(new_write_idx) {
+                        self.ble_write_char = Some((c.service_uuid, c.char_uuid));
+                    }
                 }
             }
         }
@@ -1379,7 +1376,7 @@ impl eframe::App for UartTermApp {
         }
 
         // Request repaint while connected, scanning, or dialog pending
-        let any_serial = self.serial[0].connected || self.serial[1].connected;
+        let any_serial = self.serial[0].is_connected() || self.serial[1].is_connected();
         if any_serial || self.ble_connected || self.ble_scanning || self.file_dialog_rx.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }

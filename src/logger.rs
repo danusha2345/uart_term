@@ -6,6 +6,7 @@ use std::io::Write;
 pub struct Logger {
     file: File,
     format: LogFormat,
+    pub last_error: Option<String>,
 }
 
 impl Logger {
@@ -16,7 +17,7 @@ impl Logger {
             .open(path)
             .map_err(|e| format!("Cannot open log file: {}", e))?;
 
-        let mut logger = Logger { file, format };
+        let mut logger = Logger { file, format, last_error: None };
 
         // Write session header
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
@@ -36,28 +37,31 @@ impl Logger {
             None => String::new(),
         };
 
-        match self.format {
+        let result = match self.format {
             LogFormat::Hex => {
-                let _ = writeln!(
+                writeln!(
                     self.file,
                     "{}{} {:.3}s {} {}",
                     source_prefix, dir, packet.timestamp, packet.hex_string(), label
-                );
+                )
             }
             LogFormat::Ascii => {
-                let _ = writeln!(
+                writeln!(
                     self.file,
                     "{}{} {:.3}s {} {}",
                     source_prefix, dir, packet.timestamp, packet.ascii_string(), label
-                );
+                )
             }
             LogFormat::HexAscii => {
-                let _ = writeln!(
+                writeln!(
                     self.file,
                     "{}{} {:.3}s {} |{}| {}",
                     source_prefix, dir, packet.timestamp, packet.hex_string(), packet.ascii_string(), label
-                );
+                )
             }
+        };
+        if let Err(e) = result {
+            self.last_error = Some(format!("Log write error: {}", e));
         }
     }
 

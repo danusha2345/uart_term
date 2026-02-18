@@ -7,7 +7,6 @@ use std::sync::mpsc;
 use uuid::Uuid;
 
 /// Nordic UART Service UUIDs
-pub const NUS_SERVICE: Uuid = Uuid::from_u128(0x6E400001_B5A3_F393_E0A9_E50E24DCCA9E);
 pub const NUS_RX_CHAR: Uuid = Uuid::from_u128(0x6E400002_B5A3_F393_E0A9_E50E24DCCA9E);
 pub const NUS_TX_CHAR: Uuid = Uuid::from_u128(0x6E400003_B5A3_F393_E0A9_E50E24DCCA9E);
 
@@ -17,7 +16,6 @@ pub struct BleDeviceInfo {
     pub name: String,
     pub address: String,
     pub rssi: Option<i16>,
-    pub peripheral_idx: usize,
 }
 
 /// Characteristic info for the UI
@@ -59,13 +57,6 @@ impl BleCharInfo {
             || self.properties.contains(CharPropFlags::WRITE_WITHOUT_RESPONSE)
     }
 
-    pub fn write_type(&self) -> WriteType {
-        if self.properties.contains(CharPropFlags::WRITE_WITHOUT_RESPONSE) {
-            WriteType::WithoutResponse
-        } else {
-            WriteType::WithResponse
-        }
-    }
 }
 
 /// Commands from UI to BLE thread
@@ -301,7 +292,7 @@ async fn ble_event_loop(tx: mpsc::Sender<BleMsg>, cmd_rx: mpsc::Receiver<BleCmd>
         if scanning {
             if let Ok(discovered) = adapter.peripherals().await {
                 let mut devices = Vec::new();
-                for (idx, p) in discovered.iter().enumerate() {
+                for p in discovered.iter() {
                     let props = p.properties().await.ok().flatten();
                     let name = props
                         .as_ref()
@@ -316,7 +307,6 @@ async fn ble_event_loop(tx: mpsc::Sender<BleMsg>, cmd_rx: mpsc::Receiver<BleCmd>
                         name,
                         address,
                         rssi,
-                        peripheral_idx: idx,
                     });
                 }
                 peripherals = discovered;

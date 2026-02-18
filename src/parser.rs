@@ -24,13 +24,6 @@ impl Packet {
             .join(" ")
     }
 
-    pub fn direction_arrow(&self) -> &str {
-        match self.direction {
-            Direction::Rx => "←",
-            Direction::Tx => "→",
-        }
-    }
-
     pub fn ascii_string(&self) -> String {
         self.data
             .iter()
@@ -87,6 +80,9 @@ pub fn ubx_label(data: &[u8], delimiter: &[u8]) -> Option<String> {
     }
 }
 
+/// Maximum buffer size before forced flush (protection against OOM)
+const MAX_BUFFER_SIZE: usize = 65536;
+
 /// Stream parser that splits incoming bytes by a configurable delimiter.
 pub struct StreamParser {
     delimiter: Vec<u8>,
@@ -107,16 +103,25 @@ impl StreamParser {
         self.delimiter = delimiter;
     }
 
-    pub fn delimiter(&self) -> &[u8] {
-        &self.delimiter
-    }
-
     /// Feed bytes into the parser, returns completed packets.
     pub fn feed(&mut self, data: &[u8]) -> Vec<Packet> {
         let mut packets = Vec::new();
 
         for &byte in data {
             self.buffer.push(byte);
+
+            // Flush buffer as partial packet if it exceeds max size (OOM protection)
+            if self.buffer.len() >= MAX_BUFFER_SIZE {
+                let data = std::mem::take(&mut self.buffer);
+                packets.push(Packet {
+                    timestamp: self.start_time.elapsed().as_secs_f64(),
+                    direction: Direction::Rx,
+                    data,
+                    label: None,
+                    source: None,
+                });
+                continue;
+            }
 
             // Check if the buffer ends with the delimiter
             if self.buffer.len() >= self.delimiter.len() && !self.delimiter.is_empty() {
