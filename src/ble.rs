@@ -63,7 +63,7 @@ impl BleCharInfo {
 pub enum BleCmd {
     StartScan,
     StopScan,
-    Connect(usize),
+    Connect(String),
     Disconnect,
     Subscribe(Uuid, Uuid),
     Write(Uuid, Uuid, Vec<u8>),
@@ -147,6 +147,7 @@ async fn ble_event_loop(tx: mpsc::Sender<BleMsg>, cmd_rx: mpsc::Receiver<BleCmd>
         std::pin::Pin<Box<dyn futures::Stream<Item = btleplug::api::ValueNotification> + Send>>,
     > = None;
     let mut scanning = false;
+    let mut last_scan_update = tokio::time::Instant::now();
 
     loop {
         // Process commands (non-blocking)
@@ -164,19 +165,38 @@ async fn ble_event_loop(tx: mpsc::Sender<BleMsg>, cmd_rx: mpsc::Receiver<BleCmd>
                     let _ = adapter.stop_scan().await;
                     scanning = false;
                 }
-                BleCmd::Connect(idx) => {
+                BleCmd::Connect(address) => {
                     // Stop scan first
                     if scanning {
                         let _ = adapter.stop_scan().await;
                         scanning = false;
                     }
 
-                    if idx >= peripherals.len() {
-                        let _ = tx.send(BleMsg::Error("Invalid device index".to_string()));
-                        continue;
-                    }
+                    let found = {
+                        let mut result = None;
+                        for p in &peripherals {
+                            let addr = p
+                                .properties()
+                                .await
+                                .ok()
+                                .flatten()
+                                .map(|props| props.address.to_string())
+                                .unwrap_or_default();
+                            if addr == address {
+                                result = Some(p.clone());
+                                break;
+                            }
+                        }
+                        result
+                    };
 
-                    let peripheral = peripherals[idx].clone();
+                    let peripheral = match found {
+                        Some(p) => p,
+                        None => {
+                            let _ = tx.send(BleMsg::Error("Device not found".to_string()));
+                            continue;
+                        }
+                    };
                     match peripheral.connect().await {
                         Ok(()) => {
                             // Discover services
@@ -288,8 +308,11 @@ async fn ble_event_loop(tx: mpsc::Sender<BleMsg>, cmd_rx: mpsc::Receiver<BleCmd>
             }
         }
 
-        // Poll scan results
-        if scanning {
+        // Poll scan results (rate-limited to avoid UI flicker)
+        if scanning
+            && last_scan_update.elapsed() >= tokio::time::Duration::from_millis(500)
+        {
+            last_scan_update = tokio::time::Instant::now();
             if let Ok(discovered) = adapter.peripherals().await {
                 let mut devices = Vec::new();
                 for p in discovered.iter() {

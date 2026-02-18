@@ -129,7 +129,7 @@ impl SerialConn {
             Ok(handle) => {
                 self.connection = Some(handle);
                 // Reset parser with current delimiter
-                if let Ok(delim) = parser::parse_hex_string(delimiter_input) {
+                if let Ok(delim) = parser::parse_delimiter_input(delimiter_input) {
                     self.parser = StreamParser::new(delim);
                 } else {
                     self.parser = StreamParser::new(vec![0xB5, 0x62]);
@@ -226,7 +226,7 @@ pub struct UartTermApp {
     ble_handle: Option<BleHandle>,
     ble_scanning: bool,
     ble_devices: Vec<BleDeviceInfo>,
-    ble_selected_device: Option<usize>,
+    ble_selected_device: Option<String>,
     ble_connected: bool,
     ble_chars: Vec<BleCharInfo>,
     ble_notify_char: Option<(Uuid, Uuid)>,
@@ -428,16 +428,17 @@ impl UartTermApp {
     }
 
     fn ble_connect(&mut self) {
-        if let Some(idx) = self.ble_selected_device {
+        if let Some(ref address) = self.ble_selected_device {
             if let Some(ref handle) = self.ble_handle {
                 self.status_msg = "Connecting...".to_string();
                 // Reset parser
-                if let Ok(delim) = parser::parse_hex_string(&self.delimiter_input) {
+                if let Ok(delim) = parser::parse_delimiter_input(&self.delimiter_input) {
                     self.parser = StreamParser::new(delim);
                 } else {
                     self.parser = StreamParser::new(vec![0xB5, 0x62]);
                 }
-                if let Err(e) = handle.send_cmd(BleCmd::Connect(idx)) {
+                let addr = address.clone();
+                if let Err(e) = handle.send_cmd(BleCmd::Connect(addr)) {
                     self.status_msg = format!("BLE connect error: {}", e);
                 }
                 self.start_logger();
@@ -471,7 +472,19 @@ impl UartTermApp {
         if let Some(ref handle) = self.ble_handle {
             while let Ok(msg) = handle.rx.try_recv() {
                 match msg {
-                    BleMsg::ScanResult(devices) => {
+                    BleMsg::ScanResult(mut devices) => {
+                        // Sort: named devices first, then by RSSI descending
+                        devices.sort_by(|a, b| {
+                            let a_named = !a.name.is_empty();
+                            let b_named = !b.name.is_empty();
+                            b_named
+                                .cmp(&a_named)
+                                .then_with(|| {
+                                    let a_rssi = a.rssi.unwrap_or(i16::MIN);
+                                    let b_rssi = b.rssi.unwrap_or(i16::MIN);
+                                    b_rssi.cmp(&a_rssi)
+                                })
+                        });
                         self.ble_devices = devices;
                     }
                     BleMsg::Connected(name) => {
@@ -557,6 +570,31 @@ impl UartTermApp {
     fn poll_transport(&mut self) {
         self.poll_ble_events();
         self.poll_serial(); // Always poll serial, even in BLE mode
+
+        // Flush stale parser buffers (for non-UBX data that waits for delimiter)
+        let stale_timeout = std::time::Duration::from_millis(500);
+        for i in 0..2 {
+            if self.serial[i].is_connected() {
+                if let Some(mut pkt) = self.serial[i].parser.flush_stale(stale_timeout) {
+                    pkt.source = Some(short_port_name(&self.serial[i].selected_port));
+                    if let Some(ref mut logger) = self.logger {
+                        logger.log_packet(&pkt);
+                        logger.flush();
+                    }
+                    self.packets.push(pkt);
+                }
+            }
+        }
+        if self.ble_connected {
+            if let Some(mut pkt) = self.parser.flush_stale(stale_timeout) {
+                pkt.source = Some("BLE".to_string());
+                if let Some(ref mut logger) = self.logger {
+                    logger.log_packet(&pkt);
+                    logger.flush();
+                }
+                self.packets.push(pkt);
+            }
+        }
 
         // Check logger errors
         if let Some(ref mut logger) = self.logger {
@@ -681,11 +719,14 @@ impl UartTermApp {
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut self.delimiter_input)
                     .desired_width(80.0)
-                    .hint_text("B5 62"),
+                    .hint_text("B5 62 / \\n / \"$\""),
             );
             if resp.changed() {
-                self.delimiter_input = format_hex_input(&self.delimiter_input);
-                if let Ok(delim) = parser::parse_hex_string(&self.delimiter_input) {
+                // Only auto-format as hex when no escape sequences or quotes present
+                if !self.delimiter_input.contains('\\') && !self.delimiter_input.contains('"') {
+                    self.delimiter_input = format_hex_input(&self.delimiter_input);
+                }
+                if let Ok(delim) = parser::parse_delimiter_input(&self.delimiter_input) {
                     self.parser.set_delimiter(delim.clone());
                     for conn in &mut self.serial {
                         conn.parser.set_delimiter(delim.clone());
@@ -1024,30 +1065,33 @@ impl UartTermApp {
         ui.separator();
 
         // Device combo
-        let device_text = if let Some(idx) = self.ble_selected_device {
-            if let Some(dev) = self.ble_devices.get(idx) {
-                let rssi_str = dev
-                    .rssi
-                    .map(|r| format!(" ({}dBm)", r))
-                    .unwrap_or_default();
-                if dev.name.is_empty() {
-                    format!("{}{}", dev.address, rssi_str)
-                } else {
-                    format!("{}{}", dev.name, rssi_str)
-                }
-            } else {
-                "---".to_string()
-            }
+        let device_text = if let Some(ref addr) = self.ble_selected_device {
+            self.ble_devices
+                .iter()
+                .find(|d| d.address == *addr)
+                .map(|dev| {
+                    let rssi_str = dev
+                        .rssi
+                        .map(|r| format!(" ({}dBm)", r))
+                        .unwrap_or_default();
+                    if dev.name.is_empty() {
+                        format!("{}{}", dev.address, rssi_str)
+                    } else {
+                        format!("{}{}", dev.name, rssi_str)
+                    }
+                })
+                .unwrap_or_else(|| "---".to_string())
         } else {
             "---".to_string()
         };
 
         egui::ComboBox::from_id_salt("ble_dev_combo")
             .selected_text(&device_text)
-            .width(200.0)
+            .width(280.0)
+            .height(400.0)
             .show_ui(ui, |ui| {
                 let devices = self.ble_devices.clone();
-                for (i, dev) in devices.iter().enumerate() {
+                for dev in &devices {
                     let rssi_str = dev
                         .rssi
                         .map(|r| format!(" ({}dBm)", r))
@@ -1057,7 +1101,11 @@ impl UartTermApp {
                     } else {
                         format!("{} [{}]{}", dev.name, dev.address, rssi_str)
                     };
-                    ui.selectable_value(&mut self.ble_selected_device, Some(i), &label);
+                    ui.selectable_value(
+                        &mut self.ble_selected_device,
+                        Some(dev.address.clone()),
+                        &label,
+                    );
                 }
             });
 
@@ -1124,8 +1172,8 @@ impl UartTermApp {
                         .color(egui::Color32::from_rgb(100, 200, 100)),
                 );
             } else {
-                // Show comboboxes only when there is a real choice
-                if notify_chars.len() > 1 {
+                // Show comboboxes when characteristics are available
+                if !notify_chars.is_empty() {
                     ui.label("RX:");
                     let current_label = notify_chars
                         .iter()
@@ -1155,7 +1203,7 @@ impl UartTermApp {
                     }
                 }
 
-                if write_chars.len() > 1 {
+                if !write_chars.is_empty() {
                     ui.label("TX:");
                     let current_label = write_chars
                         .iter()

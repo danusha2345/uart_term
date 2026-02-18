@@ -111,6 +111,7 @@ pub struct StreamParser {
     delimiter: Vec<u8>,
     buffer: Vec<u8>,
     start_time: std::time::Instant,
+    last_data_time: Option<std::time::Instant>,
 }
 
 impl StreamParser {
@@ -119,6 +120,7 @@ impl StreamParser {
             delimiter,
             buffer: Vec::with_capacity(1024),
             start_time: std::time::Instant::now(),
+            last_data_time: None,
         }
     }
 
@@ -129,6 +131,7 @@ impl StreamParser {
     /// Feed bytes into the parser, returns completed packets.
     pub fn feed(&mut self, data: &[u8]) -> Vec<Packet> {
         let mut packets = Vec::new();
+        self.last_data_time = Some(std::time::Instant::now());
 
         for &byte in data {
             self.buffer.push(byte);
@@ -164,6 +167,7 @@ impl StreamParser {
                             label,
                             None,
                         ));
+                        self.last_data_time = None;
                     }
 
                     // Keep the delimiter as the start of the next packet
@@ -173,6 +177,20 @@ impl StreamParser {
         }
 
         packets
+    }
+
+    /// Flush buffered data if no new data arrived within the timeout.
+    pub fn flush_stale(&mut self, timeout: std::time::Duration) -> Option<Packet> {
+        if let Some(last) = self.last_data_time {
+            if last.elapsed() >= timeout
+                && !self.buffer.is_empty()
+                && self.buffer != self.delimiter
+            {
+                self.last_data_time = None;
+                return self.flush();
+            }
+        }
+        None
     }
 
     /// Flush any remaining data as a packet.
@@ -195,6 +213,49 @@ impl StreamParser {
 
     pub fn elapsed(&self) -> f64 {
         self.start_time.elapsed().as_secs_f64()
+    }
+}
+
+/// Parse delimiter input:
+/// - `"$"` or `"GP"` — ASCII literal in quotes
+/// - `\n`, `\r\n` — escape sequences
+/// - `B5 62` — hex bytes (default)
+pub fn parse_delimiter_input(s: &str) -> Result<Vec<u8>, String> {
+    let trimmed = s.trim();
+    // Quoted ASCII literal: "$" → [0x24]
+    if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
+        let inner = &trimmed[1..trimmed.len() - 1];
+        if inner.is_empty() {
+            return Err("Empty delimiter".to_string());
+        }
+        return Ok(inner.as_bytes().to_vec());
+    }
+    // Escape sequences: \n, \r\n, \t
+    if trimmed.contains('\\') {
+        let mut bytes = Vec::new();
+        let mut chars = trimmed.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                match chars.next() {
+                    Some('n') => bytes.push(0x0A),
+                    Some('r') => bytes.push(0x0D),
+                    Some('t') => bytes.push(0x09),
+                    Some('0') => bytes.push(0x00),
+                    Some('\\') => bytes.push(b'\\'),
+                    Some(other) => return Err(format!("Unknown escape: \\{}", other)),
+                    None => return Err("Trailing backslash".to_string()),
+                }
+            } else if !c.is_whitespace() {
+                bytes.push(c as u8);
+            }
+        }
+        if bytes.is_empty() {
+            Err("Empty delimiter".to_string())
+        } else {
+            Ok(bytes)
+        }
+    } else {
+        parse_hex_string(trimmed)
     }
 }
 
