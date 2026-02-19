@@ -695,26 +695,12 @@ impl UartTermApp {
     // --- UI ---
 
     fn draw_toolbar(&mut self, ui: &mut egui::Ui) {
+        // Row 1: Transport mode + Delimiter + Filter + Log
         ui.horizontal_wrapped(|ui| {
-            // Transport mode selector
             ui.selectable_value(&mut self.transport_mode, TransportMode::Serial, "Serial");
             ui.selectable_value(&mut self.transport_mode, TransportMode::Ble, "BLE");
             ui.separator();
 
-            match self.transport_mode {
-                TransportMode::Serial => self.draw_serial_toolbar(ui, 0),
-                TransportMode::Ble => self.draw_ble_toolbar(ui),
-            }
-        });
-
-        // Second serial toolbar row (only in Serial mode)
-        if self.transport_mode == TransportMode::Serial {
-            ui.horizontal_wrapped(|ui| {
-                self.draw_serial_toolbar(ui, 1);
-            });
-        }
-
-        ui.horizontal_wrapped(|ui| {
             ui.label("Delimiter:");
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut self.delimiter_input)
@@ -722,7 +708,6 @@ impl UartTermApp {
                     .hint_text("B5 62 / \\n / \"$\""),
             );
             if resp.changed() {
-                // Only auto-format as hex when no escape sequences or quotes present
                 if !self.delimiter_input.contains('\\') && !self.delimiter_input.contains('"') {
                     self.delimiter_input = format_hex_input(&self.delimiter_input);
                 }
@@ -796,6 +781,21 @@ impl UartTermApp {
                 });
             }
         });
+
+        // Row 2: UART1 or BLE toolbar
+        ui.horizontal_wrapped(|ui| {
+            match self.transport_mode {
+                TransportMode::Serial => self.draw_serial_toolbar(ui, 0),
+                TransportMode::Ble => self.draw_ble_toolbar(ui),
+            }
+        });
+
+        // Row 3: UART2 (Serial mode only)
+        if self.transport_mode == TransportMode::Serial {
+            ui.horizontal_wrapped(|ui| {
+                self.draw_serial_toolbar(ui, 1);
+            });
+        }
     }
 
     fn draw_serial_toolbar(&mut self, ui: &mut egui::Ui, idx: usize) {
