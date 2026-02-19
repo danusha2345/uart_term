@@ -1,3 +1,25 @@
+/// Decoder/framing type
+#[derive(Clone, Copy, PartialEq)]
+pub enum DecoderType {
+    Raw,
+    Delimiter,
+    Slip,
+    Cobs,
+}
+
+impl DecoderType {
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Raw => "Raw",
+            Self::Delimiter => "Delimiter",
+            Self::Slip => "SLIP",
+            Self::Cobs => "COBS",
+        }
+    }
+
+    pub const ALL: [DecoderType; 4] = [Self::Raw, Self::Delimiter, Self::Slip, Self::Cobs];
+}
+
 /// Packet direction
 #[derive(Clone, Copy, PartialEq)]
 pub enum Direction {
@@ -106,12 +128,14 @@ pub fn ubx_label(data: &[u8], delimiter: &[u8]) -> Option<String> {
 /// Maximum buffer size before forced flush (protection against OOM)
 const MAX_BUFFER_SIZE: usize = 65536;
 
-/// Stream parser that splits incoming bytes by a configurable delimiter.
+/// Stream parser that splits incoming bytes using a configurable decoder.
 pub struct StreamParser {
     delimiter: Vec<u8>,
     buffer: Vec<u8>,
     start_time: std::time::Instant,
     last_data_time: Option<std::time::Instant>,
+    pub decoder_type: DecoderType,
+    slip_escape: bool,
 }
 
 impl StreamParser {
@@ -121,7 +145,16 @@ impl StreamParser {
             buffer: Vec::with_capacity(1024),
             start_time: std::time::Instant::now(),
             last_data_time: None,
+            decoder_type: DecoderType::Delimiter,
+            slip_escape: false,
         }
+    }
+
+    pub fn set_decoder_type(&mut self, dt: DecoderType) {
+        self.decoder_type = dt;
+        self.buffer.clear();
+        self.slip_escape = false;
+        self.last_data_time = None;
     }
 
     pub fn set_delimiter(&mut self, delimiter: Vec<u8>) {
@@ -130,8 +163,30 @@ impl StreamParser {
 
     /// Feed bytes into the parser, returns completed packets.
     pub fn feed(&mut self, data: &[u8]) -> Vec<Packet> {
-        let mut packets = Vec::new();
         self.last_data_time = Some(std::time::Instant::now());
+        match self.decoder_type {
+            DecoderType::Raw => self.feed_raw(data),
+            DecoderType::Delimiter => self.feed_delimiter(data),
+            DecoderType::Slip => self.feed_slip(data),
+            DecoderType::Cobs => self.feed_cobs(data),
+        }
+    }
+
+    fn feed_raw(&mut self, data: &[u8]) -> Vec<Packet> {
+        if data.is_empty() {
+            return Vec::new();
+        }
+        vec![Packet::new(
+            self.start_time.elapsed().as_secs_f64(),
+            Direction::Rx,
+            data.to_vec(),
+            None,
+            None,
+        )]
+    }
+
+    fn feed_delimiter(&mut self, data: &[u8]) -> Vec<Packet> {
+        let mut packets = Vec::new();
 
         for &byte in data {
             self.buffer.push(byte);
@@ -179,13 +234,102 @@ impl StreamParser {
         packets
     }
 
+    /// SLIP decoder (RFC 1055): END=0xC0, ESC=0xDB, ESC_END=0xDC, ESC_ESC=0xDD
+    fn feed_slip(&mut self, data: &[u8]) -> Vec<Packet> {
+        const END: u8 = 0xC0;
+        const ESC: u8 = 0xDB;
+        const ESC_END: u8 = 0xDC;
+        const ESC_ESC: u8 = 0xDD;
+
+        let mut packets = Vec::new();
+
+        for &byte in data {
+            if self.slip_escape {
+                self.slip_escape = false;
+                match byte {
+                    ESC_END => self.buffer.push(END),
+                    ESC_ESC => self.buffer.push(ESC),
+                    _ => self.buffer.push(byte), // tolerate malformed
+                }
+            } else {
+                match byte {
+                    END => {
+                        if !self.buffer.is_empty() {
+                            let frame = std::mem::take(&mut self.buffer);
+                            packets.push(Packet::new(
+                                self.start_time.elapsed().as_secs_f64(),
+                                Direction::Rx,
+                                frame,
+                                None,
+                                None,
+                            ));
+                            self.last_data_time = None;
+                        }
+                    }
+                    ESC => {
+                        self.slip_escape = true;
+                    }
+                    _ => {
+                        self.buffer.push(byte);
+                    }
+                }
+            }
+
+            // OOM protection
+            if self.buffer.len() >= MAX_BUFFER_SIZE {
+                let frame = std::mem::take(&mut self.buffer);
+                self.slip_escape = false;
+                packets.push(Packet::new(
+                    self.start_time.elapsed().as_secs_f64(),
+                    Direction::Rx,
+                    frame,
+                    None,
+                    None,
+                ));
+            }
+        }
+
+        packets
+    }
+
+    /// COBS decoder: accumulate until 0x00 separator, then decode frame
+    fn feed_cobs(&mut self, data: &[u8]) -> Vec<Packet> {
+        let mut packets = Vec::new();
+
+        for &byte in data {
+            if byte == 0x00 {
+                // Frame boundary
+                if !self.buffer.is_empty() {
+                    if let Some(decoded) = cobs_decode(&self.buffer) {
+                        packets.push(Packet::new(
+                            self.start_time.elapsed().as_secs_f64(),
+                            Direction::Rx,
+                            decoded,
+                            None,
+                            None,
+                        ));
+                        self.last_data_time = None;
+                    }
+                    self.buffer.clear();
+                }
+            } else {
+                self.buffer.push(byte);
+                // OOM protection
+                if self.buffer.len() >= MAX_BUFFER_SIZE {
+                    self.buffer.clear();
+                }
+            }
+        }
+
+        packets
+    }
+
     /// Flush buffered data if no new data arrived within the timeout.
     pub fn flush_stale(&mut self, timeout: std::time::Duration) -> Option<Packet> {
         if let Some(last) = self.last_data_time {
-            if last.elapsed() >= timeout
-                && !self.buffer.is_empty()
-                && self.buffer != self.delimiter
-            {
+            let is_delimiter_only = self.decoder_type == DecoderType::Delimiter
+                && self.buffer == self.delimiter;
+            if last.elapsed() >= timeout && !self.buffer.is_empty() && !is_delimiter_only {
                 self.last_data_time = None;
                 return self.flush();
             }
@@ -194,14 +338,22 @@ impl StreamParser {
     }
 
     /// Flush any remaining data as a packet.
-    /// Skips if buffer is empty or contains only the delimiter prefix.
+    /// For Delimiter mode, skips if buffer contains only the delimiter prefix.
     pub fn flush(&mut self) -> Option<Packet> {
-        if self.buffer.is_empty() || self.buffer == self.delimiter {
+        if self.buffer.is_empty() {
+            return None;
+        }
+        if self.decoder_type == DecoderType::Delimiter && self.buffer == self.delimiter {
             self.buffer.clear();
             return None;
         }
         let data = std::mem::take(&mut self.buffer);
-        let label = ubx_label(&data, &self.delimiter);
+        self.slip_escape = false;
+        let label = if self.decoder_type == DecoderType::Delimiter {
+            ubx_label(&data, &self.delimiter)
+        } else {
+            None
+        };
         Some(Packet::new(
             self.start_time.elapsed().as_secs_f64(),
             Direction::Rx,
@@ -214,6 +366,37 @@ impl StreamParser {
     pub fn elapsed(&self) -> f64 {
         self.start_time.elapsed().as_secs_f64()
     }
+}
+
+/// COBS (Consistent Overhead Byte Stuffing) decoder.
+/// Returns None for invalid encoded data.
+fn cobs_decode(encoded: &[u8]) -> Option<Vec<u8>> {
+    let mut decoded = Vec::with_capacity(encoded.len());
+    let mut i = 0;
+    while i < encoded.len() {
+        let code = encoded[i];
+        if code == 0 {
+            return None; // zero byte not allowed in COBS-encoded data
+        }
+        i += 1;
+        let run = (code as usize) - 1;
+        if i + run > encoded.len() {
+            return None; // not enough data
+        }
+        for j in 0..run {
+            decoded.push(encoded[i + j]);
+        }
+        i += run;
+        // If code < 0xFF and there's more data, a zero was removed here
+        if code < 0xFF && i < encoded.len() {
+            decoded.push(0x00);
+        }
+    }
+    // Remove trailing zero if it was added by the last group
+    if decoded.last() == Some(&0x00) {
+        decoded.pop();
+    }
+    Some(decoded)
 }
 
 /// Parse delimiter input:

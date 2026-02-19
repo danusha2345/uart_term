@@ -3,7 +3,7 @@ use uuid::Uuid;
 
 use crate::ble::{BleCharInfo, BleCmd, BleDeviceInfo, BleHandle, BleMsg};
 use crate::logger::Logger;
-use crate::parser::{self, Direction, Packet, StreamParser};
+use crate::parser::{self, DecoderType, Direction, Packet, StreamParser};
 use crate::serial::{self, SerialHandle, SerialMsg};
 
 /// Auto-format hex input: uppercase, space between every 2 hex digits
@@ -92,6 +92,7 @@ struct SerialConn {
     connection: Option<SerialHandle>,
     dtr_state: bool,
     rts_state: bool,
+    decoder_type: DecoderType,
     parser: StreamParser,
 }
 
@@ -113,6 +114,7 @@ impl SerialConn {
             connection: None,
             dtr_state: false,
             rts_state: false,
+            decoder_type: DecoderType::Delimiter,
             parser: StreamParser::new(delimiter),
         }
     }
@@ -128,12 +130,13 @@ impl SerialConn {
         ) {
             Ok(handle) => {
                 self.connection = Some(handle);
-                // Reset parser with current delimiter
+                // Reset parser with current delimiter and decoder type
                 if let Ok(delim) = parser::parse_delimiter_input(delimiter_input) {
                     self.parser = StreamParser::new(delim);
                 } else {
                     self.parser = StreamParser::new(vec![0xB5, 0x62]);
                 }
+                self.parser.set_decoder_type(self.decoder_type);
                 Ok(format!(
                     "{}: {} @ {}",
                     self.label, self.selected_port, self.selected_baud
@@ -236,6 +239,7 @@ pub struct UartTermApp {
 
     // BLE parser (serial parsers are per-connection)
     parser: StreamParser,
+    ble_decoder_type: DecoderType,
     delimiter_input: String,
 
     // Display
@@ -289,6 +293,7 @@ impl UartTermApp {
             ble_write_idx: 0,
 
             parser: StreamParser::new(default_delim),
+            ble_decoder_type: DecoderType::Delimiter,
             delimiter_input: "B5 62".to_string(),
 
             display_format: DataFormat::HexAscii,
@@ -431,12 +436,13 @@ impl UartTermApp {
         if let Some(ref address) = self.ble_selected_device {
             if let Some(ref handle) = self.ble_handle {
                 self.status_msg = "Connecting...".to_string();
-                // Reset parser
+                // Reset parser with current decoder type
                 if let Ok(delim) = parser::parse_delimiter_input(&self.delimiter_input) {
                     self.parser = StreamParser::new(delim);
                 } else {
                     self.parser = StreamParser::new(vec![0xB5, 0x62]);
                 }
+                self.parser.set_decoder_type(self.ble_decoder_type);
                 let addr = address.clone();
                 if let Err(e) = handle.send_cmd(BleCmd::Connect(addr)) {
                     self.status_msg = format!("BLE connect error: {}", e);
@@ -1039,6 +1045,23 @@ impl UartTermApp {
                 }
             }
         }
+
+        ui.separator();
+
+        // Decoder type
+        let mut new_dt = self.serial[idx].decoder_type;
+        egui::ComboBox::from_id_salt(format!("{}_dec", salt))
+            .selected_text(self.serial[idx].decoder_type.label())
+            .width(70.0)
+            .show_ui(ui, |ui| {
+                for dt in DecoderType::ALL {
+                    ui.selectable_value(&mut new_dt, dt, dt.label());
+                }
+            });
+        if new_dt != self.serial[idx].decoder_type {
+            self.serial[idx].decoder_type = new_dt;
+            self.serial[idx].parser.set_decoder_type(new_dt);
+        }
     }
 
     fn draw_ble_toolbar(&mut self, ui: &mut egui::Ui) {
@@ -1136,6 +1159,23 @@ impl UartTermApp {
             {
                 self.ble_connect();
             }
+        }
+
+        ui.separator();
+
+        // BLE Decoder type
+        let mut new_ble_dt = self.ble_decoder_type;
+        egui::ComboBox::from_id_salt("ble_dec_combo")
+            .selected_text(self.ble_decoder_type.label())
+            .width(70.0)
+            .show_ui(ui, |ui| {
+                for dt in DecoderType::ALL {
+                    ui.selectable_value(&mut new_ble_dt, dt, dt.label());
+                }
+            });
+        if new_ble_dt != self.ble_decoder_type {
+            self.ble_decoder_type = new_ble_dt;
+            self.parser.set_decoder_type(new_ble_dt);
         }
 
         // Characteristic selectors (only when connected)
