@@ -140,6 +140,9 @@ pub struct StreamParser {
     last_data_time: Option<std::time::Instant>,
     pub decoder_type: DecoderType,
     slip_escape: bool,
+    /// True if current buffer accumulated without any delimiter/frame boundary match.
+    /// Packets flushed by gap or overflow with this flag set are likely noise.
+    unframed: bool,
 }
 
 impl StreamParser {
@@ -151,6 +154,7 @@ impl StreamParser {
             last_data_time: None,
             decoder_type: DecoderType::Delimiter,
             slip_escape: false,
+            unframed: true,
         }
     }
 
@@ -158,6 +162,15 @@ impl StreamParser {
         self.decoder_type = dt;
         self.buffer.clear();
         self.slip_escape = false;
+        self.unframed = true;
+        self.last_data_time = None;
+    }
+
+    /// Discard any buffered data without emitting a packet.
+    pub fn clear(&mut self) {
+        self.buffer.clear();
+        self.slip_escape = false;
+        self.unframed = true;
         self.last_data_time = None;
     }
 
@@ -197,14 +210,19 @@ impl StreamParser {
 
             // Flush buffer as partial packet if it exceeds max size (OOM protection)
             if self.buffer.len() >= MAX_BUFFER_SIZE {
+                let unframed = self.unframed;
                 let data = std::mem::take(&mut self.buffer);
-                packets.push(Packet::new(
+                let mut pkt = Packet::new(
                     self.start_time.elapsed().as_secs_f64(),
                     Direction::Rx,
                     data,
                     None,
                     None,
-                ));
+                );
+                if unframed {
+                    pkt.noise = true;
+                }
+                packets.push(pkt);
                 continue;
             }
 
@@ -214,6 +232,7 @@ impl StreamParser {
                 let delim_len = self.delimiter.len();
 
                 if self.buffer[buf_len - delim_len..] == self.delimiter[..] {
+                    self.unframed = false;
                     // Everything before the delimiter is a complete packet
                     let packet_data: Vec<u8> = self.buffer[..buf_len - delim_len].to_vec();
 
@@ -336,7 +355,9 @@ impl StreamParser {
         if self.decoder_type == DecoderType::Delimiter && self.buffer == self.delimiter {
             return None; // keep delimiter prefix for next packet
         }
+        let unframed = self.unframed;
         self.last_data_time = None;
+        self.unframed = true; // reset for next accumulation
         let data = std::mem::take(&mut self.buffer);
         self.slip_escape = false;
         let label = if self.decoder_type == DecoderType::Delimiter {
@@ -344,13 +365,18 @@ impl StreamParser {
         } else {
             None
         };
-        Some(Packet::new(
+        let mut pkt = Packet::new(
             self.start_time.elapsed().as_secs_f64(),
             Direction::Rx,
             data,
             label,
             None,
-        ))
+        );
+        // In Delimiter mode, gap-flushed data that never matched a delimiter is noise
+        if self.decoder_type == DecoderType::Delimiter && unframed {
+            pkt.noise = true;
+        }
+        Some(pkt)
     }
 
     /// Flush buffered data if no new data arrived within the timeout.
@@ -376,6 +402,8 @@ impl StreamParser {
             self.buffer.clear();
             return None;
         }
+        let unframed = self.unframed;
+        self.unframed = true;
         let data = std::mem::take(&mut self.buffer);
         self.slip_escape = false;
         let label = if self.decoder_type == DecoderType::Delimiter {
@@ -383,13 +411,17 @@ impl StreamParser {
         } else {
             None
         };
-        Some(Packet::new(
+        let mut pkt = Packet::new(
             self.start_time.elapsed().as_secs_f64(),
             Direction::Rx,
             data,
             label,
             None,
-        ))
+        );
+        if self.decoder_type == DecoderType::Delimiter && unframed {
+            pkt.noise = true;
+        }
+        Some(pkt)
     }
 
     pub fn elapsed(&self) -> f64 {
@@ -428,12 +460,12 @@ fn cobs_decode(encoded: &[u8]) -> Option<Vec<u8>> {
     Some(decoded)
 }
 
-/// Detect noise packets (floating UART lines).
-/// Floating lines produce bytes with few bits set (line mostly LOW, occasional noise pulses).
+/// Detect noise packets (floating/unpowered UART lines).
 /// Returns true if data looks like line noise:
 /// - Packet entirely zeros (any length)
 /// - Packet >4 bytes with <=2 unique byte values
-/// - Packet >32 bytes with average popcount < 3.0 (floating line signature)
+/// - Packet exactly MAX_BUFFER_SIZE (no delimiter found in entire buffer — strong noise signal)
+/// - Packet >32 bytes with average popcount < 3.0 (floating line, mostly LOW)
 pub fn is_noise(data: &[u8]) -> bool {
     if data.is_empty() {
         return false;
@@ -443,6 +475,10 @@ pub fn is_noise(data: &[u8]) -> bool {
     }
     if data.len() <= 4 {
         return false;
+    }
+    // Packet hit MAX_BUFFER_SIZE = delimiter never matched = almost certainly noise
+    if data.len() >= MAX_BUFFER_SIZE {
+        return true;
     }
     // Check unique byte values
     let mut seen = [false; 256];

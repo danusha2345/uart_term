@@ -146,11 +146,12 @@ impl SerialConn {
         }
     }
 
-    fn disconnect(&mut self) -> Option<Packet> {
+    fn disconnect(&mut self) {
         if let Some(handle) = self.connection.take() {
             handle.disconnect();
         }
-        self.parser.flush()
+        // Discard partial buffer — last gap_flush already emitted complete data
+        self.parser.clear();
     }
 
     /// Poll serial handle, push packets into shared vec, log them.
@@ -366,16 +367,7 @@ impl UartTermApp {
     }
 
     fn serial_disconnect(&mut self, idx: usize) {
-        if let Some(mut pkt) = self.serial[idx].disconnect() {
-            pkt.source = Some(short_port_name(&self.serial[idx].selected_port));
-            if !(self.noise_filter && pkt.noise) {
-                if let Some(ref mut logger) = self.logger {
-                    logger.log_packet(&pkt);
-                    logger.flush();
-                }
-            }
-            self.packets.push(pkt);
-        }
+        self.serial[idx].disconnect();
         // Update status
         let any_connected = self.serial[0].is_connected() || self.serial[1].is_connected();
         if !any_connected {
@@ -1299,8 +1291,9 @@ impl UartTermApp {
             .collect();
 
         let row_height = 18.0;
-        let output = egui::ScrollArea::vertical()
+        egui::ScrollArea::vertical()
             .auto_shrink([false; 2])
+            .stick_to_bottom(self.auto_scroll)
             .show_rows(ui, row_height, filtered.len(), |ui, range| {
                 for pkt in &filtered[range] {
                     let (dir_color, arrow) = match pkt.direction {
@@ -1364,20 +1357,6 @@ impl UartTermApp {
                     });
                 }
             });
-
-        // Smooth animated auto-scroll instead of instant stick_to_bottom
-        if self.auto_scroll && !filtered.is_empty() {
-            let max_offset = (output.content_size.y - output.inner_rect.height()).max(0.0);
-            let smoothed = ui.ctx().animate_value_with_time(
-                output.id.with("auto_scroll_y"),
-                max_offset,
-                0.15,
-            );
-            // Clamp: never exceed max_offset (prevents blank space on window resize)
-            let mut state = output.state;
-            state.offset.y = smoothed.min(max_offset);
-            state.store(ui.ctx(), output.id);
-        }
     }
 
     fn draw_send_bar(&mut self, ui: &mut egui::Ui) {
@@ -1525,7 +1504,9 @@ impl eframe::App for UartTermApp {
             }
         }
 
-        // Request repaint while connected, scanning, connecting, or dialog pending
+        // Always repaint at low rate for responsive UI (scroll, interactions)
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        // Fast repaint while actively receiving data
         let any_serial = self.serial[0].is_connected() || self.serial[1].is_connected();
         let ble_active = self.ble_connected || self.ble_scanning || self.ble_handle.is_some();
         if any_serial || ble_active || self.file_dialog_rx.is_some() {
