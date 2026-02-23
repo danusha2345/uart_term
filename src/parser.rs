@@ -37,6 +37,7 @@ pub struct Packet {
     pub source: Option<String>,
     pub hex: String,
     pub ascii: String,
+    pub noise: bool,
 }
 
 impl Packet {
@@ -63,6 +64,7 @@ impl Packet {
                 }
             })
             .collect();
+        let noise = direction == Direction::Rx && is_noise(&data);
         Self {
             timestamp,
             direction,
@@ -71,6 +73,7 @@ impl Packet {
             source,
             hex,
             ascii,
+            noise,
         }
     }
 
@@ -125,8 +128,9 @@ pub fn ubx_label(data: &[u8], delimiter: &[u8]) -> Option<String> {
     }
 }
 
-/// Maximum buffer size before forced flush (protection against OOM)
-const MAX_BUFFER_SIZE: usize = 65536;
+/// Maximum buffer size before forced flush (protection against OOM).
+/// Kept small so noise from floating lines produces filterable-size packets.
+const MAX_BUFFER_SIZE: usize = 4096;
 
 /// Stream parser that splits incoming bytes using a configurable decoder.
 pub struct StreamParser {
@@ -324,6 +328,31 @@ impl StreamParser {
         packets
     }
 
+    /// Flush buffer on gap (pause in data stream). Works for all decoder modes.
+    pub fn gap_flush(&mut self) -> Option<Packet> {
+        if self.buffer.is_empty() {
+            return None;
+        }
+        if self.decoder_type == DecoderType::Delimiter && self.buffer == self.delimiter {
+            return None; // keep delimiter prefix for next packet
+        }
+        self.last_data_time = None;
+        let data = std::mem::take(&mut self.buffer);
+        self.slip_escape = false;
+        let label = if self.decoder_type == DecoderType::Delimiter {
+            ubx_label(&data, &self.delimiter)
+        } else {
+            None
+        };
+        Some(Packet::new(
+            self.start_time.elapsed().as_secs_f64(),
+            Direction::Rx,
+            data,
+            label,
+            None,
+        ))
+    }
+
     /// Flush buffered data if no new data arrived within the timeout.
     pub fn flush_stale(&mut self, timeout: std::time::Duration) -> Option<Packet> {
         if let Some(last) = self.last_data_time {
@@ -397,6 +426,48 @@ fn cobs_decode(encoded: &[u8]) -> Option<Vec<u8>> {
         decoded.pop();
     }
     Some(decoded)
+}
+
+/// Detect noise packets (floating UART lines).
+/// Floating lines produce bytes with few bits set (line mostly LOW, occasional noise pulses).
+/// Returns true if data looks like line noise:
+/// - Packet entirely zeros (any length)
+/// - Packet >4 bytes with <=2 unique byte values
+/// - Packet >32 bytes with average popcount < 3.0 (floating line signature)
+pub fn is_noise(data: &[u8]) -> bool {
+    if data.is_empty() {
+        return false;
+    }
+    if data.iter().all(|&b| b == 0) {
+        return true;
+    }
+    if data.len() <= 4 {
+        return false;
+    }
+    // Check unique byte values
+    let mut seen = [false; 256];
+    let mut unique = 0u16;
+    let mut total_bits = 0u32;
+    for &b in data {
+        if !seen[b as usize] {
+            seen[b as usize] = true;
+            unique += 1;
+        }
+        total_bits += b.count_ones();
+    }
+    if unique <= 2 {
+        return true;
+    }
+    // Average popcount check for longer packets.
+    // Floating UART lines produce bytes with avg popcount ~2.5.
+    // Real data (protocols, ASCII) has avg popcount ~3.5-4.5.
+    if data.len() > 32 {
+        let avg_popcount = total_bits as f32 / data.len() as f32;
+        if avg_popcount < 3.0 {
+            return true;
+        }
+    }
+    false
 }
 
 /// Parse delimiter input:

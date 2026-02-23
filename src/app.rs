@@ -155,7 +155,7 @@ impl SerialConn {
 
     /// Poll serial handle, push packets into shared vec, log them.
     /// Returns an error/status message if something happened.
-    fn poll(&mut self, packets: &mut Vec<Packet>, logger: &mut Option<Logger>) -> Option<String> {
+    fn poll(&mut self, packets: &mut Vec<Packet>, logger: &mut Option<Logger>, noise_filter: bool) -> Option<String> {
         if self.connection.is_none() {
             return None;
         }
@@ -170,6 +170,11 @@ impl SerialConn {
                     SerialMsg::Data(data) => {
                         let pkts = self.parser.feed(&data);
                         new_packets.extend(pkts);
+                    }
+                    SerialMsg::Gap => {
+                        if let Some(pkt) = self.parser.gap_flush() {
+                            new_packets.push(pkt);
+                        }
                     }
                     SerialMsg::Error(e) => {
                         error_msg = Some(format!("{}: Error: {}", self.label, e));
@@ -198,10 +203,12 @@ impl SerialConn {
             pkt.source = Some(source.clone());
         }
 
-        // Log
+        // Log (skip noise when filter is on)
         for pkt in &new_packets {
-            if let Some(ref mut l) = logger {
-                l.log_packet(pkt);
+            if !(noise_filter && pkt.noise) {
+                if let Some(ref mut l) = logger {
+                    l.log_packet(pkt);
+                }
             }
         }
         if !new_packets.is_empty() {
@@ -249,6 +256,7 @@ pub struct UartTermApp {
     max_packets: usize,
     filter_input: String,
     filter_bytes: Vec<u8>,
+    noise_filter: bool,
 
     // Send
     send_input: String,
@@ -302,6 +310,7 @@ impl UartTermApp {
             max_packets: 10000,
             filter_input: String::new(),
             filter_bytes: Vec::new(),
+            noise_filter: true,
 
             send_input: String::new(),
             line_ending: LineEnding::None,
@@ -359,9 +368,11 @@ impl UartTermApp {
     fn serial_disconnect(&mut self, idx: usize) {
         if let Some(mut pkt) = self.serial[idx].disconnect() {
             pkt.source = Some(short_port_name(&self.serial[idx].selected_port));
-            if let Some(ref mut logger) = self.logger {
-                logger.log_packet(&pkt);
-                logger.flush();
+            if !(self.noise_filter && pkt.noise) {
+                if let Some(ref mut logger) = self.logger {
+                    logger.log_packet(&pkt);
+                    logger.flush();
+                }
             }
             self.packets.push(pkt);
         }
@@ -393,8 +404,9 @@ impl UartTermApp {
     }
 
     fn poll_serial(&mut self) {
+        let nf = self.noise_filter;
         for i in 0..2 {
-            if let Some(err) = self.serial[i].poll(&mut self.packets, &mut self.logger) {
+            if let Some(err) = self.serial[i].poll(&mut self.packets, &mut self.logger, nf) {
                 self.status_msg = err;
             }
         }
@@ -577,20 +589,8 @@ impl UartTermApp {
         self.poll_ble_events();
         self.poll_serial(); // Always poll serial, even in BLE mode
 
-        // Flush stale parser buffers (for non-UBX data that waits for delimiter)
+        // Flush stale parser buffers (BLE only — serial uses Gap detection)
         let stale_timeout = std::time::Duration::from_millis(500);
-        for i in 0..2 {
-            if self.serial[i].is_connected() {
-                if let Some(mut pkt) = self.serial[i].parser.flush_stale(stale_timeout) {
-                    pkt.source = Some(short_port_name(&self.serial[i].selected_port));
-                    if let Some(ref mut logger) = self.logger {
-                        logger.log_packet(&pkt);
-                        logger.flush();
-                    }
-                    self.packets.push(pkt);
-                }
-            }
-        }
         if self.ble_connected {
             if let Some(mut pkt) = self.parser.flush_stale(stale_timeout) {
                 pkt.source = Some("BLE".to_string());
@@ -737,6 +737,8 @@ impl UartTermApp {
                 self.filter_bytes =
                     parser::parse_hex_string(&self.filter_input).unwrap_or_default();
             }
+            ui.checkbox(&mut self.noise_filter, "Noise")
+                .on_hover_text("Filter out noise packets (repetitive data from floating lines)");
 
             ui.separator();
 
@@ -1287,6 +1289,9 @@ impl UartTermApp {
             .packets
             .iter()
             .filter(|pkt| {
+                if self.noise_filter && pkt.noise {
+                    return false;
+                }
                 self.filter_bytes.is_empty()
                     || pkt.direction == Direction::Tx
                     || pkt.data.starts_with(&self.filter_bytes)

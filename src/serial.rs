@@ -5,6 +5,7 @@ use std::time::Duration;
 /// Messages from serial reading thread to GUI
 pub enum SerialMsg {
     Data(Vec<u8>),
+    Gap,
     Error(String),
     Disconnected,
 }
@@ -26,12 +27,15 @@ impl SerialHandle {
         stop_bits: serialport::StopBits,
         flow_control: serialport::FlowControl,
     ) -> Result<Self, String> {
+        // Adaptive timeout: ~20 byte-times, min 2ms, max 50ms
+        let timeout_ms = (200_000u64 / baud_rate as u64).max(2).min(50);
+
         let port = serialport::new(port_name, baud_rate)
             .data_bits(data_bits)
             .parity(parity)
             .stop_bits(stop_bits)
             .flow_control(flow_control)
-            .timeout(Duration::from_millis(50))
+            .timeout(Duration::from_millis(timeout_ms))
             .open()
             .map_err(|e| format!("Cannot open {}: {}", port_name, e))?;
 
@@ -62,18 +66,34 @@ impl SerialHandle {
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) {
         let mut buf = [0u8; 1024];
+        let mut had_data = false;
         loop {
             if stop.load(std::sync::atomic::Ordering::Relaxed) {
                 break;
             }
             match reader.read(&mut buf) {
                 Ok(n) if n > 0 => {
+                    had_data = true;
                     if tx.send(SerialMsg::Data(buf[..n].to_vec())).is_err() {
                         break;
                     }
                 }
-                Ok(_) => {} // timeout, no data
-                Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+                Ok(_) => {
+                    if had_data {
+                        had_data = false;
+                        if tx.send(SerialMsg::Gap).is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    if had_data {
+                        had_data = false;
+                        if tx.send(SerialMsg::Gap).is_err() {
+                            break;
+                        }
+                    }
+                }
                 Err(e) => {
                     let _ = tx.send(SerialMsg::Error(e.to_string()));
                     let _ = tx.send(SerialMsg::Disconnected);
