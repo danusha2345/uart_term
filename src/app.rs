@@ -780,6 +780,16 @@ impl UartTermApp {
                     }
                 });
             }
+
+            if ui.button("+").on_hover_text("New log file").clicked() {
+                self.log_path = Self::make_log_path();
+                if self.log_enabled && self.is_connected() {
+                    match Logger::new(&self.log_path, self.log_format) {
+                        Ok(l) => self.logger = Some(l),
+                        Err(e) => self.status_msg = format!("Log error: {}", e),
+                    }
+                }
+            }
         });
 
         // Row 2: UART1 or BLE toolbar
