@@ -1,6 +1,9 @@
 use serialport::{self, SerialPort};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use crate::parser;
 
 /// Messages from serial reading thread to GUI
 pub enum SerialMsg {
@@ -134,4 +137,93 @@ pub fn list_ports() -> Vec<String> {
         Ok(ports) => ports.into_iter().map(|p| p.port_name).collect(),
         Err(_) => vec![],
     }
+}
+
+/// Probe duration per baud rate candidate
+const PROBE_DURATION: Duration = Duration::from_millis(300);
+
+/// Auto-detect baud rate by trying each candidate and scoring received data.
+/// Returns `Some((baud_rate, score))` on success, `None` if no data received.
+pub fn probe_baud_rate(
+    port_name: &str,
+    candidates: &[u32],
+    delimiter: &[u8],
+    data_bits: serialport::DataBits,
+    parity: serialport::Parity,
+    stop_bits: serialport::StopBits,
+    stop: &AtomicBool,
+) -> Option<(u32, usize)> {
+    let mut best: Option<(u32, usize)> = None;
+
+    for &baud in candidates {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let port = serialport::new(port_name, baud)
+            .data_bits(data_bits)
+            .parity(parity)
+            .stop_bits(stop_bits)
+            .flow_control(serialport::FlowControl::None)
+            .timeout(Duration::from_millis(50))
+            .open();
+
+        let mut port = match port {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        // Read data for PROBE_DURATION
+        let mut collected = Vec::new();
+        let start = Instant::now();
+        let mut buf = [0u8; 1024];
+        while start.elapsed() < PROBE_DURATION {
+            if stop.load(Ordering::Relaxed) {
+                return best;
+            }
+            match port.read(&mut buf) {
+                Ok(n) if n > 0 => collected.extend_from_slice(&buf[..n]),
+                _ => {}
+            }
+        }
+        drop(port);
+
+        if collected.is_empty() {
+            continue;
+        }
+
+        // Score the data
+        let delimiter_count = parser::count_delimiter(&collected, delimiter);
+        let noise = parser::is_noise(&collected);
+
+        let mut seen = [false; 256];
+        let mut unique_bytes = 0u16;
+        for &b in &collected {
+            if !seen[b as usize] {
+                seen[b as usize] = true;
+                unique_bytes += 1;
+            }
+        }
+
+        let mut score = delimiter_count * 50;
+        if !noise && collected.len() > 4 {
+            score += 20;
+        }
+        if unique_bytes > 10 {
+            score += 10;
+        }
+
+        // Early exit on high confidence
+        if delimiter_count >= 2 {
+            return Some((baud, score));
+        }
+
+        if score > 0 {
+            if best.is_none() || score > best.unwrap().1 {
+                best = Some((baud, score));
+            }
+        }
+    }
+
+    best
 }

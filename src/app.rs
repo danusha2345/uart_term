@@ -5,6 +5,8 @@ use crate::ble::{BleCharInfo, BleCmd, BleDeviceInfo, BleHandle, BleMsg};
 use crate::logger::Logger;
 use crate::parser::{self, DecoderType, Direction, Packet, StreamParser};
 use crate::serial::{self, SerialHandle, SerialMsg};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 /// Auto-format hex input: uppercase, space between every 2 hex digits
 fn format_hex_input(raw: &str) -> String {
@@ -94,6 +96,8 @@ struct SerialConn {
     rts_state: bool,
     decoder_type: DecoderType,
     parser: StreamParser,
+    baud_probe_rx: Option<std::sync::mpsc::Receiver<Option<(u32, usize)>>>,
+    baud_probe_stop: Option<Arc<AtomicBool>>,
 }
 
 impl SerialConn {
@@ -116,6 +120,8 @@ impl SerialConn {
             rts_state: false,
             decoder_type: DecoderType::Delimiter,
             parser: StreamParser::new(delimiter),
+            baud_probe_rx: None,
+            baud_probe_stop: None,
         }
     }
 
@@ -869,6 +875,55 @@ impl UartTermApp {
             }
         }
 
+        // Auto-detect baud rate button
+        let probing = self.serial[idx].baud_probe_rx.is_some();
+        let can_probe = !self.serial[idx].is_connected() && !probing
+            && !self.serial[idx].selected_port.is_empty();
+        let auto_label = if probing { "..." } else { "Auto" };
+        if ui
+            .add_enabled(can_probe, egui::Button::new(auto_label))
+            .on_hover_text("Auto-detect baud rate")
+            .clicked()
+        {
+            // Build candidate list: current baud first, then defaults, deduplicated
+            let current = self.serial[idx].selected_baud;
+            let mut candidates = vec![current];
+            let preferred = [921600u32, 115200];
+            for &r in preferred.iter().chain(BAUD_RATES.iter()) {
+                if !candidates.contains(&r) {
+                    candidates.push(r);
+                }
+            }
+
+            let port_name = self.serial[idx].selected_port.clone();
+            let delimiter = parser::parse_delimiter_input(&self.delimiter_input)
+                .unwrap_or_else(|_| vec![0xB5, 0x62]);
+            let data_bits = self.serial[idx].data_bits;
+            let parity = self.serial[idx].parity;
+            let stop_bits = self.serial[idx].stop_bits;
+
+            let (tx, rx) = std::sync::mpsc::channel();
+            let stop_flag = Arc::new(AtomicBool::new(false));
+            let stop_clone = stop_flag.clone();
+
+            std::thread::spawn(move || {
+                let result = serial::probe_baud_rate(
+                    &port_name,
+                    &candidates,
+                    &delimiter,
+                    data_bits,
+                    parity,
+                    stop_bits,
+                    &stop_clone,
+                );
+                let _ = tx.send(result);
+            });
+
+            self.serial[idx].baud_probe_rx = Some(rx);
+            self.serial[idx].baud_probe_stop = Some(stop_flag);
+            self.status_msg = format!("{}: Auto-detecting...", self.serial[idx].label);
+        }
+
         ui.separator();
 
         // Data bits
@@ -1500,6 +1555,37 @@ impl eframe::App for UartTermApp {
         // Poll transport data
         self.poll_transport();
 
+        // Poll baud rate probe results
+        for i in 0..2 {
+            if let Some(ref rx) = self.serial[i].baud_probe_rx {
+                match rx.try_recv() {
+                    Ok(Some((rate, score))) => {
+                        self.serial[i].selected_baud = rate;
+                        self.serial[i].baud_input = rate.to_string();
+                        self.serial[i].baud_probe_rx = None;
+                        self.serial[i].baud_probe_stop = None;
+                        self.status_msg = format!(
+                            "{}: Auto-detected {} (score {})",
+                            self.serial[i].label, rate, score
+                        );
+                    }
+                    Ok(None) => {
+                        self.serial[i].baud_probe_rx = None;
+                        self.serial[i].baud_probe_stop = None;
+                        self.status_msg = format!(
+                            "{}: Auto-detect: no data received",
+                            self.serial[i].label
+                        );
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        self.serial[i].baud_probe_rx = None;
+                        self.serial[i].baud_probe_stop = None;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                }
+            }
+        }
+
         // Poll file dialog result
         if let Some(ref rx) = self.file_dialog_rx {
             match rx.try_recv() {
@@ -1519,7 +1605,9 @@ impl eframe::App for UartTermApp {
         // Fast repaint while actively receiving data
         let any_serial = self.serial[0].is_connected() || self.serial[1].is_connected();
         let ble_active = self.ble_connected || self.ble_scanning || self.ble_handle.is_some();
-        if any_serial || ble_active || self.file_dialog_rx.is_some() {
+        let any_probing = self.serial[0].baud_probe_rx.is_some()
+            || self.serial[1].baud_probe_rx.is_some();
+        if any_serial || ble_active || any_probing || self.file_dialog_rx.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
 

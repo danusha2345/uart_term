@@ -506,6 +506,20 @@ pub fn is_noise(data: &[u8]) -> bool {
     false
 }
 
+/// Count occurrences of `delimiter` in `data` using sliding window.
+pub fn count_delimiter(data: &[u8], delimiter: &[u8]) -> usize {
+    if delimiter.is_empty() || data.len() < delimiter.len() {
+        return 0;
+    }
+    let mut count = 0;
+    for i in 0..=data.len() - delimiter.len() {
+        if &data[i..i + delimiter.len()] == delimiter {
+            count += 1;
+        }
+    }
+    count
+}
+
 /// Parse delimiter input:
 /// - `"$"` or `"GP"` — ASCII literal in quotes
 /// - `\n`, `\r\n` — escape sequences
