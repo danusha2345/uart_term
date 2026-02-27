@@ -403,11 +403,14 @@ impl UartTermApp {
 
     fn poll_serial(&mut self) {
         let nf = self.noise_filter;
+        let start = self.packets.len();
         for i in 0..2 {
             if let Some(err) = self.serial[i].poll(&mut self.packets, &mut self.logger, nf) {
                 self.status_msg = err;
             }
         }
+        // Sort newly added packets by timestamp for strict chronological order
+        self.packets[start..].sort_by(|a, b| a.timestamp.partial_cmp(&b.timestamp).unwrap());
     }
 
     // --- BLE ---
