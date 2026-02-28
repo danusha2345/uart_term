@@ -162,7 +162,7 @@ impl SerialConn {
 
     /// Poll serial handle, push packets into shared vec, log them.
     /// Returns an error/status message if something happened.
-    fn poll(&mut self, packets: &mut Vec<Packet>, logger: &mut Option<Logger>, noise_filter: bool) -> Option<String> {
+    fn poll(&mut self, source_idx: u8, packets: &mut Vec<Packet>, logger: &mut Option<Logger>, noise_filter: bool) -> Option<String> {
         if self.connection.is_none() {
             return None;
         }
@@ -208,6 +208,7 @@ impl SerialConn {
         let source = short_port_name(&self.selected_port);
         for pkt in &mut new_packets {
             pkt.source = Some(source.clone());
+            pkt.source_idx = Some(source_idx);
         }
 
         // Log (skip noise when filter is on)
@@ -405,7 +406,7 @@ impl UartTermApp {
         let nf = self.noise_filter;
         let start = self.packets.len();
         for i in 0..2 {
-            if let Some(err) = self.serial[i].poll(&mut self.packets, &mut self.logger, nf) {
+            if let Some(err) = self.serial[i].poll(i as u8, &mut self.packets, &mut self.logger, nf) {
                 self.status_msg = err;
             }
         }
@@ -644,13 +645,14 @@ impl UartTermApp {
                                     let source = short_port_name(
                                         &self.serial[target].selected_port,
                                     );
-                                    let pkt = Packet::new(
+                                    let mut pkt = Packet::new(
                                         self.serial[target].parser.elapsed(),
                                         Direction::Tx,
                                         bytes,
                                         None,
                                         Some(source),
                                     );
+                                    pkt.source_idx = Some(target as u8);
                                     if let Some(ref mut logger) = self.logger {
                                         logger.log_packet(&pkt);
                                         logger.flush();
@@ -1335,12 +1337,18 @@ impl UartTermApp {
     }
 
     fn draw_packet_view(&self, ui: &mut egui::Ui) {
-        let rx_color = egui::Color32::from_rgb(80, 220, 120); // green
+        let rx_colors = [
+            egui::Color32::from_rgb(80, 220, 120),  // green — UART1 / default
+            egui::Color32::from_rgb(120, 180, 255),  // blue — UART2
+        ];
         let tx_color = egui::Color32::from_rgb(255, 200, 60); // yellow
         let ts_color = egui::Color32::from_rgb(140, 140, 140); // grey
         let label_color = egui::Color32::from_rgb(120, 180, 255); // light blue
         let ascii_color = egui::Color32::from_rgb(180, 160, 200); // muted purple
-        let source_color = egui::Color32::from_rgb(100, 200, 200); // teal
+        let source_colors = [
+            egui::Color32::from_rgb(100, 200, 200), // teal — UART1
+            egui::Color32::from_rgb(200, 160, 100), // orange — UART2
+        ];
 
         let mono = egui::FontId::monospace(13.0);
 
@@ -1364,6 +1372,10 @@ impl UartTermApp {
             .stick_to_bottom(self.auto_scroll)
             .show_rows(ui, row_height, filtered.len(), |ui, range| {
                 for pkt in &filtered[range] {
+                    let rx_color = pkt
+                        .source_idx
+                        .map(|i| rx_colors[i as usize % rx_colors.len()])
+                        .unwrap_or(rx_colors[0]);
                     let (dir_color, arrow) = match pkt.direction {
                         Direction::Rx => (rx_color, "< "),
                         Direction::Tx => (tx_color, "> "),
@@ -1377,9 +1389,13 @@ impl UartTermApp {
                         ..Default::default()
                     };
 
-                    // Source (port name)
+                    // Source (port name) — color-coded per UART
                     if let Some(ref source) = pkt.source {
-                        job.append(&format!("{} ", source), 0.0, fmt(source_color));
+                        let sc = pkt
+                            .source_idx
+                            .map(|i| source_colors[i as usize % source_colors.len()])
+                            .unwrap_or(source_colors[0]);
+                        job.append(&format!("{} ", source), 0.0, fmt(sc));
                     }
 
                     // Arrow

@@ -35,6 +35,8 @@ pub struct Packet {
     pub data: Vec<u8>,
     pub label: Option<String>,
     pub source: Option<String>,
+    /// Source index for color coding (0 = UART1, 1 = UART2)
+    pub source_idx: Option<u8>,
     pub hex: String,
     pub ascii: String,
     pub noise: bool,
@@ -71,6 +73,7 @@ impl Packet {
             data,
             label,
             source,
+            source_idx: None,
             hex,
             ascii,
             noise,
