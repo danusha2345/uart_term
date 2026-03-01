@@ -717,14 +717,16 @@ impl UartTermApp {
                     .hint_text("B5 62 / \\n / \"$\""),
             );
             if resp.changed() {
-                if !self.delimiter_input.contains('\\') && !self.delimiter_input.contains('"') {
-                    self.delimiter_input = format_hex_input(&self.delimiter_input);
-                }
                 if let Ok(delim) = parser::parse_delimiter_input(&self.delimiter_input) {
                     self.parser.set_delimiter(delim.clone());
                     for conn in &mut self.serial {
                         conn.parser.set_delimiter(delim.clone());
                     }
+                }
+            }
+            if resp.lost_focus() {
+                if !self.delimiter_input.contains('\\') && !self.delimiter_input.contains('"') {
+                    self.delimiter_input = format_hex_input(&self.delimiter_input);
                 }
             }
 
