@@ -204,10 +204,6 @@ impl SerialConn {
             }
         }
 
-        // Drop delimiter-only packets (parser edge case: e.g. gap split mid-delimiter)
-        let delim = self.parser.delimiter();
-        new_packets.retain(|pkt| pkt.data != delim);
-
         // Set source on all new packets
         let source = short_port_name(&self.selected_port);
         for pkt in &mut new_packets {

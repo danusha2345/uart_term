@@ -177,10 +177,6 @@ impl StreamParser {
         self.last_data_time = None;
     }
 
-    pub fn delimiter(&self) -> &[u8] {
-        &self.delimiter
-    }
-
     pub fn set_delimiter(&mut self, delimiter: Vec<u8>) {
         self.delimiter = delimiter;
     }
@@ -260,6 +256,10 @@ impl StreamParser {
                 }
             }
         }
+
+        // Drop delimiter-only ghost packets (edge case: gap split mid-delimiter)
+        let delim = &self.delimiter;
+        packets.retain(|pkt| pkt.data != *delim);
 
         packets
     }
