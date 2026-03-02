@@ -341,7 +341,19 @@ impl UartTermApp {
 
     fn start_logger(&mut self) {
         if self.log_enabled {
-            self.log_path = Self::make_log_path();
+            if self.log_path.is_empty() {
+                self.log_path = Self::make_log_path();
+            }
+            match Logger::new(&self.log_path, self.log_format) {
+                Ok(l) => self.logger = Some(l),
+                Err(e) => self.status_msg = format!("Log error: {}", e),
+            }
+        }
+    }
+
+    /// Recreate logger for the current log_path (e.g. after path change).
+    fn restart_logger(&mut self) {
+        if self.log_enabled {
             match Logger::new(&self.log_path, self.log_format) {
                 Ok(l) => self.logger = Some(l),
                 Err(e) => self.status_msg = format!("Log error: {}", e),
@@ -363,9 +375,8 @@ impl UartTermApp {
         match self.serial[idx].connect(&delimiter_input) {
             Ok(msg) => {
                 self.status_msg = msg;
-                if self.logger.is_none() {
-                    self.start_logger();
-                }
+                self.log_path = Self::make_log_path();
+                self.restart_logger();
             }
             Err(e) => {
                 self.status_msg = e;
@@ -461,7 +472,8 @@ impl UartTermApp {
                 if let Err(e) = handle.send_cmd(BleCmd::Connect(addr)) {
                     self.status_msg = format!("BLE connect error: {}", e);
                 }
-                self.start_logger();
+                self.log_path = Self::make_log_path();
+                self.restart_logger();
             }
         }
     }
@@ -771,11 +783,14 @@ impl UartTermApp {
                 self.logger = None;
             }
 
-            ui.add(
+            let log_resp = ui.add(
                 egui::TextEdit::singleline(&mut self.log_path)
                     .desired_width(150.0)
                     .hint_text("uart_log.txt"),
             );
+            if log_resp.lost_focus() {
+                self.restart_logger();
+            }
 
             if ui.button("...").on_hover_text("Choose log file").clicked()
                 && self.file_dialog_rx.is_none()
@@ -796,12 +811,7 @@ impl UartTermApp {
 
             if ui.button("+").on_hover_text("New log file").clicked() {
                 self.log_path = Self::make_log_path();
-                if self.log_enabled && self.is_connected() {
-                    match Logger::new(&self.log_path, self.log_format) {
-                        Ok(l) => self.logger = Some(l),
-                        Err(e) => self.status_msg = format!("Log error: {}", e),
-                    }
-                }
+                self.restart_logger();
             }
         });
 
@@ -1613,6 +1623,7 @@ impl eframe::App for UartTermApp {
                 Ok(path) => {
                     self.log_path = path;
                     self.file_dialog_rx = None;
+                    self.restart_logger();
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     self.file_dialog_rx = None;
