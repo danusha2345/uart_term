@@ -96,6 +96,7 @@ struct SerialConn {
     rts_state: bool,
     decoder_type: DecoderType,
     parser: StreamParser,
+    start_time: std::time::Instant,
     baud_probe_rx: Option<std::sync::mpsc::Receiver<Option<(u32, usize)>>>,
     baud_probe_stop: Option<Arc<AtomicBool>>,
 }
@@ -105,7 +106,7 @@ impl SerialConn {
         self.connection.is_some()
     }
 
-    fn new(label: &str, default_port: &str, delimiter: Vec<u8>) -> Self {
+    fn new(label: &str, default_port: &str, delimiter: Vec<u8>, start_time: std::time::Instant) -> Self {
         Self {
             label: label.to_string(),
             selected_port: default_port.to_string(),
@@ -119,7 +120,8 @@ impl SerialConn {
             dtr_state: false,
             rts_state: false,
             decoder_type: DecoderType::Delimiter,
-            parser: StreamParser::new(delimiter),
+            parser: StreamParser::new(delimiter, start_time),
+            start_time,
             baud_probe_rx: None,
             baud_probe_stop: None,
         }
@@ -138,9 +140,9 @@ impl SerialConn {
                 self.connection = Some(handle);
                 // Reset parser with current delimiter and decoder type
                 if let Ok(delim) = parser::parse_delimiter_input(delimiter_input) {
-                    self.parser = StreamParser::new(delim);
+                    self.parser = StreamParser::new(delim, self.start_time);
                 } else {
-                    self.parser = StreamParser::new(vec![0xB5, 0x62]);
+                    self.parser = StreamParser::new(vec![0xB5, 0x62], self.start_time);
                 }
                 self.parser.set_decoder_type(self.decoder_type);
                 Ok(format!(
@@ -231,6 +233,9 @@ impl SerialConn {
 }
 
 pub struct UartTermApp {
+    // Global start time for consistent packet timestamps
+    app_start: std::time::Instant,
+
     // Transport
     transport_mode: TransportMode,
 
@@ -265,6 +270,8 @@ pub struct UartTermApp {
     filter_input: String,
     filter_bytes: Vec<u8>,
     noise_filter: bool,
+    /// Timestamp of the first received packet (for relative display starting from 0)
+    first_packet_time: Option<f64>,
 
     // Send
     send_input: String,
@@ -285,13 +292,15 @@ impl UartTermApp {
         let ports = serial::list_ports();
         let default_port = ports.first().cloned().unwrap_or_default();
         let default_delim = vec![0xB5, 0x62];
+        let app_start = std::time::Instant::now();
 
         Self {
+            app_start,
             transport_mode: TransportMode::Serial,
 
             serial: [
-                SerialConn::new("UART1", &default_port, default_delim.clone()),
-                SerialConn::new("UART2", &default_port, default_delim.clone()),
+                SerialConn::new("UART1", &default_port, default_delim.clone(), app_start),
+                SerialConn::new("UART2", &default_port, default_delim.clone(), app_start),
             ],
             send_target: 0,
             available_ports: ports,
@@ -308,7 +317,7 @@ impl UartTermApp {
             ble_notify_idx: 0,
             ble_write_idx: 0,
 
-            parser: StreamParser::new(default_delim),
+            parser: StreamParser::new(default_delim, app_start),
             ble_decoder_type: DecoderType::Delimiter,
             delimiter_input: "B5 62".to_string(),
 
@@ -319,6 +328,7 @@ impl UartTermApp {
             filter_input: String::new(),
             filter_bytes: Vec::new(),
             noise_filter: true,
+            first_packet_time: None,
 
             send_input: String::new(),
             line_ending: LineEnding::None,
@@ -463,9 +473,9 @@ impl UartTermApp {
                 self.status_msg = "Connecting...".to_string();
                 // Reset parser with current decoder type
                 if let Ok(delim) = parser::parse_delimiter_input(&self.delimiter_input) {
-                    self.parser = StreamParser::new(delim);
+                    self.parser = StreamParser::new(delim, self.app_start);
                 } else {
-                    self.parser = StreamParser::new(vec![0xB5, 0x62]);
+                    self.parser = StreamParser::new(vec![0xB5, 0x62], self.app_start);
                 }
                 self.parser.set_decoder_type(self.ble_decoder_type);
                 let addr = address.clone();
@@ -1348,7 +1358,7 @@ impl UartTermApp {
         }
     }
 
-    fn draw_packet_view(&self, ui: &mut egui::Ui) {
+    fn draw_packet_view(&mut self, ui: &mut egui::Ui) {
         let rx_colors = [
             egui::Color32::from_rgb(80, 220, 120),  // green — UART1 / default
             egui::Color32::from_rgb(120, 180, 255),  // blue — UART2
@@ -1377,6 +1387,14 @@ impl UartTermApp {
                     || pkt.data.starts_with(&self.filter_bytes)
             })
             .collect();
+
+        // Compute time offset so first packet starts at 0
+        if self.first_packet_time.is_none() {
+            if let Some(pkt) = filtered.first() {
+                self.first_packet_time = Some(pkt.timestamp);
+            }
+        }
+        let time_offset = self.first_packet_time.unwrap_or(0.0);
 
         let row_height = 18.0;
         egui::ScrollArea::vertical()
@@ -1413,8 +1431,8 @@ impl UartTermApp {
                     // Arrow
                     job.append(arrow, 0.0, fmt(dir_color));
 
-                    // Timestamp
-                    let ts = format!("{:10.3}s  ", pkt.timestamp);
+                    // Timestamp (relative to first packet)
+                    let ts = format!("{:10.3}s  ", pkt.timestamp - time_offset);
                     job.append(&ts, 0.0, fmt(ts_color));
 
                     // Data columns based on display format
@@ -1548,6 +1566,7 @@ impl UartTermApp {
 
             if ui.button("Clear").clicked() {
                 self.packets.clear();
+                self.first_packet_time = None;
             }
 
             if ui

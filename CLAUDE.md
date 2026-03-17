@@ -31,3 +31,4 @@ cargo run            # Run debug
 - Serial polling runs regardless of transport mode (prevents channel backlog on mode switch)
 - File dialogs use `rfd` crate for native cross-platform support
 - Send input accepts hex with or without spaces (`B562` and `B5 62` both work)
+- Packet timestamps are relative to the first received packet (starts at 0), reset on Clear
