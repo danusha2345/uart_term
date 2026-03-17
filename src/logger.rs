@@ -7,6 +7,8 @@ pub struct Logger {
     file: File,
     format: LogFormat,
     pub last_error: Option<String>,
+    /// Timestamp of the first packet (subtracted to get relative time from 0)
+    first_packet_time: Option<f64>,
 }
 
 impl Logger {
@@ -17,7 +19,7 @@ impl Logger {
             .open(path)
             .map_err(|e| format!("Cannot open log file: {}", e))?;
 
-        let mut logger = Logger { file, format, last_error: None };
+        let mut logger = Logger { file, format, last_error: None, first_packet_time: None };
 
         // Write session header
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
@@ -27,6 +29,11 @@ impl Logger {
     }
 
     pub fn log_packet(&mut self, packet: &Packet) {
+        if self.first_packet_time.is_none() {
+            self.first_packet_time = Some(packet.timestamp);
+        }
+        let relative_time = packet.timestamp - self.first_packet_time.unwrap_or(0.0);
+
         let dir = match packet.direction {
             Direction::Rx => "<",
             Direction::Tx => ">",
@@ -42,21 +49,21 @@ impl Logger {
                 writeln!(
                     self.file,
                     "{}{} {:.3}s {} {}",
-                    source_prefix, dir, packet.timestamp, packet.hex_string(), label
+                    source_prefix, dir, relative_time, packet.hex_string(), label
                 )
             }
             LogFormat::Ascii => {
                 writeln!(
                     self.file,
                     "{}{} {:.3}s {} {}",
-                    source_prefix, dir, packet.timestamp, packet.ascii_string(), label
+                    source_prefix, dir, relative_time, packet.ascii_string(), label
                 )
             }
             LogFormat::HexAscii => {
                 writeln!(
                     self.file,
                     "{}{} {:.3}s {} |{}| {}",
-                    source_prefix, dir, packet.timestamp, packet.hex_string(), packet.ascii_string(), label
+                    source_prefix, dir, relative_time, packet.hex_string(), packet.ascii_string(), label
                 )
             }
         };
