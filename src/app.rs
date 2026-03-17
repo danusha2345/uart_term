@@ -1388,9 +1388,9 @@ impl UartTermApp {
             })
             .collect();
 
-        // Compute time offset so first packet starts at 0
+        // Compute time offset so first packet starts at 0 (based on all packets, not filtered)
         if self.first_packet_time.is_none() {
-            if let Some(pkt) = filtered.first() {
+            if let Some(pkt) = self.packets.first() {
                 self.first_packet_time = Some(pkt.timestamp);
             }
         }
