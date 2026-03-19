@@ -111,8 +111,31 @@ pub fn ubx_class_name(class_byte: u8) -> &'static str {
     }
 }
 
+/// Verify UBX Fletcher-8 checksum.
+/// Returns Some(true) if CRC matches, Some(false) if it doesn't,
+/// None if the packet is too short or malformed to check.
+pub fn ubx_crc_valid(data: &[u8]) -> Option<bool> {
+    // Minimum UBX frame: sync(2) + class(1) + id(1) + length(2) + checksum(2) = 8
+    if data.len() < 8 || data[0] != 0xB5 || data[1] != 0x62 {
+        return None;
+    }
+    let payload_len = u16::from_le_bytes([data[4], data[5]]) as usize;
+    let expected_len = 8 + payload_len; // sync(2) + class(1) + id(1) + len(2) + payload + ck(2)
+    if data.len() != expected_len {
+        return Some(false); // length mismatch
+    }
+    let mut ck_a: u8 = 0;
+    let mut ck_b: u8 = 0;
+    for &b in &data[2..data.len() - 2] {
+        ck_a = ck_a.wrapping_add(b);
+        ck_b = ck_b.wrapping_add(ck_a);
+    }
+    Some(ck_a == data[data.len() - 2] && ck_b == data[data.len() - 1])
+}
+
 /// Try to generate a UBX label for the packet.
 /// Only applies when delimiter is [0xB5, 0x62].
+/// Appends [CRC!] if checksum validation fails (indicates data corruption).
 pub fn ubx_label(data: &[u8], delimiter: &[u8]) -> Option<String> {
     if delimiter != [0xB5, 0x62] {
         return None;
@@ -124,11 +147,15 @@ pub fn ubx_label(data: &[u8], delimiter: &[u8]) -> Option<String> {
     let cls = data[2];
     let id = data[3];
     let name = ubx_class_name(cls);
-    if name.is_empty() {
-        Some(format!("[0x{:02X}-0x{:02X}]", cls, id))
+    let mut label = if name.is_empty() {
+        format!("[0x{:02X}-0x{:02X}]", cls, id)
     } else {
-        Some(format!("[{}-0x{:02X}]", name, id))
+        format!("[{}-0x{:02X}]", name, id)
+    };
+    if let Some(false) = ubx_crc_valid(data) {
+        label.push_str(" [CRC!]");
     }
+    Some(label)
 }
 
 /// Maximum buffer size before forced flush (protection against OOM).
@@ -149,11 +176,11 @@ pub struct StreamParser {
 }
 
 impl StreamParser {
-    pub fn new(delimiter: Vec<u8>) -> Self {
+    pub fn new(delimiter: Vec<u8>, start_time: std::time::Instant) -> Self {
         Self {
             delimiter,
             buffer: Vec::with_capacity(1024),
-            start_time: std::time::Instant::now(),
+            start_time,
             last_data_time: None,
             decoder_type: DecoderType::Delimiter,
             slip_escape: false,
@@ -209,16 +236,15 @@ impl StreamParser {
         let mut packets = Vec::new();
 
         for &byte in data {
-            self.buffer.push(byte);
-
-            // Flush buffer as partial packet if it exceeds max size (OOM protection)
+            // Flush buffer BEFORE pushing if it exceeds max size (OOM protection).
+            // Don't skip delimiter check — the new byte may complete a delimiter.
             if self.buffer.len() >= MAX_BUFFER_SIZE {
                 let unframed = self.unframed;
-                let data = std::mem::take(&mut self.buffer);
+                let buf = std::mem::take(&mut self.buffer);
                 let mut pkt = Packet::new(
                     self.start_time.elapsed().as_secs_f64(),
                     Direction::Rx,
-                    data,
+                    buf,
                     None,
                     None,
                 );
@@ -226,8 +252,10 @@ impl StreamParser {
                     pkt.noise = true;
                 }
                 packets.push(pkt);
-                continue;
+                self.unframed = true;
             }
+
+            self.buffer.push(byte);
 
             // Check if the buffer ends with the delimiter
             if self.buffer.len() >= self.delimiter.len() && !self.delimiter.is_empty() {
@@ -239,7 +267,7 @@ impl StreamParser {
                     // Everything before the delimiter is a complete packet
                     let packet_data: Vec<u8> = self.buffer[..buf_len - delim_len].to_vec();
 
-                    if !packet_data.is_empty() {
+                    if !packet_data.is_empty() && packet_data != self.delimiter {
                         let label = ubx_label(&packet_data, &self.delimiter);
                         packets.push(Packet::new(
                             self.start_time.elapsed().as_secs_f64(),
@@ -256,10 +284,6 @@ impl StreamParser {
                 }
             }
         }
-
-        // Drop delimiter-only ghost packets (edge case: gap split mid-delimiter)
-        let delim = &self.delimiter;
-        packets.retain(|pkt| pkt.data != *delim);
 
         packets
     }
@@ -361,6 +385,16 @@ impl StreamParser {
         }
         if self.decoder_type == DecoderType::Delimiter && self.buffer == self.delimiter {
             return None; // keep delimiter prefix for next packet
+        }
+        // Don't flush if assembling a framed packet in Delimiter mode.
+        // Gap was caused by OS scheduling jitter, not a real stream break.
+        // For forced flush (disconnect), use flush() instead.
+        if self.decoder_type == DecoderType::Delimiter
+            && !self.unframed
+            && self.buffer.starts_with(&self.delimiter)
+            && self.buffer.len() > self.delimiter.len()
+        {
+            return None;
         }
         let unframed = self.unframed;
         self.last_data_time = None;

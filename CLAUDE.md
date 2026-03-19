@@ -6,7 +6,7 @@ Cross-platform serial port monitor built with Rust + eframe/egui.
 
 - `src/main.rs` — Entry point, eframe initialization
 - `src/app.rs` — Main application state and UI (toolbar, packet view, send bar)
-- `src/parser.rs` — Stream parser (delimiter-based), hex utilities, UBX label lookup, `Packet` struct with cached hex/ascii
+- `src/parser.rs` — Stream parser (delimiter-based), hex utilities, UBX label lookup + CRC validation, `Packet` struct with cached hex/ascii
 - `src/serial.rs` — Serial port handle with background reader thread
 - `src/logger.rs` — File logger for packets
 - `src/ble.rs` — BLE transport (NUS profile support, auto-detection)
@@ -28,6 +28,8 @@ cargo run            # Run debug
 - `Packet` pre-computes hex/ascii strings at creation time (cached, not per-frame)
 - Packet view uses `ScrollArea::show_rows()` for virtualized rendering (only visible rows)
 - `StreamParser::flush()` skips delimiter-only buffers to avoid ghost packets on disconnect
+- `gap_flush()` preserves in-progress framed packets (avoids splitting on OS scheduling jitter)
+- UBX packets with bad Fletcher-8 checksum get `[CRC!]` label (hardware data loss diagnostic)
 - Serial polling runs regardless of transport mode (prevents channel backlog on mode switch)
 - File dialogs use `rfd` crate for native cross-platform support
 - Send input accepts hex with or without spaces (`B562` and `B5 62` both work)
