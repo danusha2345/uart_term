@@ -154,12 +154,37 @@ impl SerialConn {
         }
     }
 
-    fn disconnect(&mut self) {
+    /// Drain any pending messages, flush partial buffer as a final packet,
+    /// and tear down the reader thread. The final packet (if any) is pushed
+    /// into `packets` so nothing in the buffer is lost on Disconnect.
+    fn disconnect(
+        &mut self,
+        source_idx: u8,
+        packets: &mut Vec<Packet>,
+        logger: &mut Option<Logger>,
+        noise_filter: bool,
+    ) {
+        // First, drain anything the reader thread has already pushed into
+        // the channel but we haven't polled yet.
+        let _ = self.poll(source_idx, packets, logger, noise_filter);
+
+        // Any partial data still buffered in the parser becomes one last packet.
+        if let Some(mut pkt) = self.parser.flush() {
+            let source = short_port_name(&self.selected_port);
+            pkt.source = Some(source);
+            pkt.source_idx = Some(source_idx);
+            if !(noise_filter && pkt.noise) {
+                if let Some(ref mut l) = logger {
+                    l.log_packet(&pkt);
+                    l.flush();
+                }
+            }
+            packets.push(pkt);
+        }
+
         if let Some(handle) = self.connection.take() {
             handle.disconnect();
         }
-        // Discard partial buffer — last gap_flush already emitted complete data
-        self.parser.clear();
     }
 
     /// Poll serial handle, push packets into shared vec, log them.
@@ -395,7 +420,8 @@ impl UartTermApp {
     }
 
     fn serial_disconnect(&mut self, idx: usize) {
-        self.serial[idx].disconnect();
+        let nf = self.noise_filter;
+        self.serial[idx].disconnect(idx as u8, &mut self.packets, &mut self.logger, nf);
         // Update status
         let any_connected = self.serial[0].is_connected() || self.serial[1].is_connected();
         if !any_connected {

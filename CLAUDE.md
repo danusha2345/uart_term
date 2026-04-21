@@ -15,8 +15,17 @@ Cross-platform serial port monitor built with Rust + eframe/egui.
 
 ```bash
 cargo build          # Debug build
-cargo build --release # Release build
+cargo build --release # Release build (use `-j 2` on low-RAM hosts to avoid OOM)
 cargo run            # Run debug
+```
+
+### System dependencies (Linux)
+
+`rfd` is built with the `gtk3` feature, so GTK 3 dev headers are required:
+
+```bash
+sudo apt install libgtk-3-dev libglib2.0-dev libatk1.0-dev \
+                 libgdk-pixbuf-2.0-dev libpango1.0-dev libcairo2-dev pkg-config
 ```
 
 ## Key Design Decisions
@@ -34,3 +43,7 @@ cargo run            # Run debug
 - File dialogs use `rfd` crate for native cross-platform support
 - Send input accepts hex with or without spaces (`B562` and `B5 62` both work)
 - Packet timestamps are relative to the first received packet (starts at 0), reset on Clear
+- `MAX_BUFFER_SIZE = 72 KiB` fits the UBX worst case (64 KiB payload + framing) without clipping valid frames
+- Data captured before the very first delimiter in a session is marked `noise=true` (startup garbage)
+- COBS decoder preserves a trailing `0x00` byte inside the payload (no blind trim)
+- `SerialConn::disconnect` drains any pending channel messages and flushes the partial buffer as a final packet before killing the reader thread — no tail packets are lost on user-initiated Disconnect

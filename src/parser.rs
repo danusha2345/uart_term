@@ -159,8 +159,8 @@ pub fn ubx_label(data: &[u8], delimiter: &[u8]) -> Option<String> {
 }
 
 /// Maximum buffer size before forced flush (protection against OOM).
-/// Kept small so noise from floating lines produces filterable-size packets.
-const MAX_BUFFER_SIZE: usize = 4096;
+/// Sized for the UBX worst case (64 KiB payload + framing) plus headroom.
+const MAX_BUFFER_SIZE: usize = 72 * 1024;
 
 /// Stream parser that splits incoming bytes using a configurable decoder.
 pub struct StreamParser {
@@ -190,14 +190,6 @@ impl StreamParser {
 
     pub fn set_decoder_type(&mut self, dt: DecoderType) {
         self.decoder_type = dt;
-        self.buffer.clear();
-        self.slip_escape = false;
-        self.unframed = true;
-        self.last_data_time = None;
-    }
-
-    /// Discard any buffered data without emitting a packet.
-    pub fn clear(&mut self) {
         self.buffer.clear();
         self.slip_escape = false;
         self.unframed = true;
@@ -263,19 +255,25 @@ impl StreamParser {
                 let delim_len = self.delimiter.len();
 
                 if self.buffer[buf_len - delim_len..] == self.delimiter[..] {
+                    let was_unframed = self.unframed;
                     self.unframed = false;
                     // Everything before the delimiter is a complete packet
                     let packet_data: Vec<u8> = self.buffer[..buf_len - delim_len].to_vec();
 
                     if !packet_data.is_empty() && packet_data != self.delimiter {
                         let label = ubx_label(&packet_data, &self.delimiter);
-                        packets.push(Packet::new(
+                        let mut pkt = Packet::new(
                             self.start_time.elapsed().as_secs_f64(),
                             Direction::Rx,
                             packet_data,
                             label,
                             None,
-                        ));
+                        );
+                        // Data captured before the very first delimiter is startup garbage
+                        if was_unframed {
+                            pkt.noise = true;
+                        }
+                        packets.push(pkt);
                         self.last_data_time = None;
                     }
 
@@ -494,10 +492,6 @@ fn cobs_decode(encoded: &[u8]) -> Option<Vec<u8>> {
             decoded.push(0x00);
         }
     }
-    // Remove trailing zero if it was added by the last group
-    if decoded.last() == Some(&0x00) {
-        decoded.pop();
-    }
     Some(decoded)
 }
 
@@ -505,8 +499,11 @@ fn cobs_decode(encoded: &[u8]) -> Option<Vec<u8>> {
 /// Returns true if data looks like line noise:
 /// - Packet entirely zeros (any length)
 /// - Packet >4 bytes with <=2 unique byte values
-/// - Packet exactly MAX_BUFFER_SIZE (no delimiter found in entire buffer — strong noise signal)
 /// - Packet >32 bytes with average popcount < 3.0 (floating line, mostly LOW)
+///
+/// Note: hitting MAX_BUFFER_SIZE is handled separately — the parser
+/// marks such packets as noise only when they never contained a delimiter
+/// (`unframed == true`), so large legitimate frames are not misclassified.
 pub fn is_noise(data: &[u8]) -> bool {
     if data.is_empty() {
         return false;
@@ -516,10 +513,6 @@ pub fn is_noise(data: &[u8]) -> bool {
     }
     if data.len() <= 4 {
         return false;
-    }
-    // Packet hit MAX_BUFFER_SIZE = delimiter never matched = almost certainly noise
-    if data.len() >= MAX_BUFFER_SIZE {
-        return true;
     }
     // Check unique byte values
     let mut seen = [false; 256];
