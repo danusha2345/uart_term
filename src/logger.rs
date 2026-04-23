@@ -19,7 +19,12 @@ impl Logger {
             .open(path)
             .map_err(|e| format!("Cannot open log file: {}", e))?;
 
-        let mut logger = Logger { file, format, last_error: None, first_packet_time: None };
+        let mut logger = Logger {
+            file,
+            format,
+            last_error: None,
+            first_packet_time: None,
+        };
 
         // Write session header
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
@@ -49,21 +54,34 @@ impl Logger {
                 writeln!(
                     self.file,
                     "{}{} {:.3}s {} {}",
-                    source_prefix, dir, relative_time, packet.hex_string(), label
+                    source_prefix,
+                    dir,
+                    relative_time,
+                    packet.hex_string(),
+                    label
                 )
             }
             LogFormat::Ascii => {
                 writeln!(
                     self.file,
                     "{}{} {:.3}s {} {}",
-                    source_prefix, dir, relative_time, packet.ascii_string(), label
+                    source_prefix,
+                    dir,
+                    relative_time,
+                    packet.ascii_string(),
+                    label
                 )
             }
             LogFormat::HexAscii => {
                 writeln!(
                     self.file,
                     "{}{} {:.3}s {} |{}| {}",
-                    source_prefix, dir, relative_time, packet.hex_string(), packet.ascii_string(), label
+                    source_prefix,
+                    dir,
+                    relative_time,
+                    packet.hex_string(),
+                    packet.ascii_string(),
+                    label
                 )
             }
         };

@@ -39,7 +39,10 @@ impl BleCharInfo {
         if self.properties.contains(CharPropFlags::WRITE) {
             flags.push('W');
         }
-        if self.properties.contains(CharPropFlags::WRITE_WITHOUT_RESPONSE) {
+        if self
+            .properties
+            .contains(CharPropFlags::WRITE_WITHOUT_RESPONSE)
+        {
             flags.push('w');
         }
         if self.properties.contains(CharPropFlags::READ) {
@@ -54,9 +57,10 @@ impl BleCharInfo {
 
     pub fn supports_write(&self) -> bool {
         self.properties.contains(CharPropFlags::WRITE)
-            || self.properties.contains(CharPropFlags::WRITE_WITHOUT_RESPONSE)
+            || self
+                .properties
+                .contains(CharPropFlags::WRITE_WITHOUT_RESPONSE)
     }
-
 }
 
 /// Commands from UI to BLE thread
@@ -201,10 +205,8 @@ async fn ble_event_loop(tx: mpsc::Sender<BleMsg>, cmd_rx: mpsc::Receiver<BleCmd>
                         Ok(()) => {
                             // Discover services
                             if let Err(e) = peripheral.discover_services().await {
-                                let _ = tx.send(BleMsg::Error(format!(
-                                    "Service discovery error: {}",
-                                    e
-                                )));
+                                let _ = tx
+                                    .send(BleMsg::Error(format!("Service discovery error: {}", e)));
                                 continue;
                             }
 
@@ -254,27 +256,24 @@ async fn ble_event_loop(tx: mpsc::Sender<BleMsg>, cmd_rx: mpsc::Receiver<BleCmd>
                         let chr = find_characteristic(p, svc_uuid, char_uuid);
                         if let Some(c) = chr {
                             match p.subscribe(&c).await {
-                                Ok(()) => {
-                                    match p.notifications().await {
-                                        Ok(stream) => {
-                                            notification_stream = Some(Box::pin(stream));
-                                        }
-                                        Err(e) => {
-                                            let _ = tx.send(BleMsg::Error(format!(
-                                                "Notification stream error: {}",
-                                                e
-                                            )));
-                                        }
+                                Ok(()) => match p.notifications().await {
+                                    Ok(stream) => {
+                                        notification_stream = Some(Box::pin(stream));
                                     }
-                                }
+                                    Err(e) => {
+                                        let _ = tx.send(BleMsg::Error(format!(
+                                            "Notification stream error: {}",
+                                            e
+                                        )));
+                                    }
+                                },
                                 Err(e) => {
                                     let _ =
                                         tx.send(BleMsg::Error(format!("Subscribe error: {}", e)));
                                 }
                             }
                         } else {
-                            let _ =
-                                tx.send(BleMsg::Error("Characteristic not found".to_string()));
+                            let _ = tx.send(BleMsg::Error("Characteristic not found".to_string()));
                         }
                     }
                 }
@@ -292,8 +291,8 @@ async fn ble_event_loop(tx: mpsc::Sender<BleMsg>, cmd_rx: mpsc::Receiver<BleCmd>
                                 let _ = tx.send(BleMsg::Error(format!("Write error: {}", e)));
                             }
                         } else {
-                            let _ =
-                                tx.send(BleMsg::Error("Write characteristic not found".to_string()));
+                            let _ = tx
+                                .send(BleMsg::Error("Write characteristic not found".to_string()));
                         }
                     }
                 }
@@ -309,9 +308,7 @@ async fn ble_event_loop(tx: mpsc::Sender<BleMsg>, cmd_rx: mpsc::Receiver<BleCmd>
         }
 
         // Poll scan results (rate-limited to avoid UI flicker)
-        if scanning
-            && last_scan_update.elapsed() >= tokio::time::Duration::from_millis(500)
-        {
+        if scanning && last_scan_update.elapsed() >= tokio::time::Duration::from_millis(500) {
             last_scan_update = tokio::time::Instant::now();
             if let Ok(discovered) = adapter.peripherals().await {
                 let mut devices = Vec::new();
@@ -378,5 +375,10 @@ fn find_characteristic(
         .services()
         .iter()
         .find(|s| s.uuid == svc_uuid)
-        .and_then(|s| s.characteristics.iter().find(|c| c.uuid == char_uuid).cloned())
+        .and_then(|s| {
+            s.characteristics
+                .iter()
+                .find(|c| c.uuid == char_uuid)
+                .cloned()
+        })
 }

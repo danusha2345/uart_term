@@ -31,7 +31,7 @@ impl SerialHandle {
         flow_control: serialport::FlowControl,
     ) -> Result<Self, String> {
         // Adaptive timeout: ~20 byte-times, min 2ms, max 50ms
-        let timeout_ms = (200_000u64 / baud_rate as u64).max(2).min(50);
+        let timeout_ms = (200_000u64 / baud_rate as u64).clamp(2, 50);
 
         let port = serialport::new(port_name, baud_rate)
             .data_bits(data_bits)
@@ -82,12 +82,8 @@ impl SerialHandle {
                     }
                 }
                 Ok(_) => {
-                    if had_data {
-                        had_data = false;
-                        if tx.send(SerialMsg::Gap).is_err() {
-                            break;
-                        }
-                    }
+                    let _ = tx.send(SerialMsg::Disconnected);
+                    break;
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
                     if had_data {
@@ -218,10 +214,8 @@ pub fn probe_baud_rate(
             return Some((baud, score));
         }
 
-        if score > 0 {
-            if best.is_none() || score > best.unwrap().1 {
-                best = Some((baud, score));
-            }
+        if score > 0 && (best.is_none() || score > best.unwrap().1) {
+            best = Some((baud, score));
         }
     }
 

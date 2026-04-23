@@ -6,7 +6,7 @@ Cross-platform serial port monitor built with Rust + eframe/egui.
 
 - `src/main.rs` — Entry point, eframe initialization
 - `src/app.rs` — Main application state and UI (toolbar, packet view, send bar)
-- `src/parser.rs` — Stream parser (delimiter-based), hex utilities, UBX label lookup + CRC validation, `Packet` struct with cached hex/ascii
+- `src/parser.rs` — Stream parser (Raw/Delimiter/SLIP/COBS/NMEA), hex utilities, UBX/NMEA label lookup + CRC validation, `Packet` struct with cached hex/ascii
 - `src/serial.rs` — Serial port handle with background reader thread
 - `src/logger.rs` — File logger for packets
 - `src/ble.rs` — BLE transport (NUS profile support, auto-detection)
@@ -33,12 +33,13 @@ sudo apt install libgtk-3-dev libglib2.0-dev libatk1.0-dev \
 - Serial I/O runs on a background thread; GUI polls via `mpsc::try_recv()`
 - Dual serial connections (UART1/UART2) with shared packet view
 - BLE transport with Nordic UART Service (NUS) auto-detection
-- Packets are split by a configurable delimiter (default: `B5 62` for u-blox UBX)
+- Packets are split by selectable decoders: Raw, Delimiter (default `B5 62` for u-blox UBX), SLIP, COBS, or NMEA
 - `Packet` pre-computes hex/ascii strings at creation time (cached, not per-frame)
 - Packet view uses `ScrollArea::show_rows()` for virtualized rendering (only visible rows)
 - `StreamParser::flush()` skips delimiter-only buffers to avoid ghost packets on disconnect
 - `gap_flush()` preserves in-progress framed packets (avoids splitting on OS scheduling jitter)
 - UBX packets with bad Fletcher-8 checksum get `[CRC!]` label (hardware data loss diagnostic)
+- NMEA decoder frames `$...LF`, strips trailing CR/LF, labels sentences like `[GN-RMC]`, and appends `[CRC!]` on checksum mismatch
 - Serial polling runs regardless of transport mode (prevents channel backlog on mode switch)
 - File dialogs use `rfd` crate for native cross-platform support
 - Send input accepts hex with or without spaces (`B562` and `B5 62` both work)
@@ -47,3 +48,4 @@ sudo apt install libgtk-3-dev libglib2.0-dev libatk1.0-dev \
 - Data captured before the very first delimiter in a session is marked `noise=true` (startup garbage)
 - COBS decoder preserves a trailing `0x00` byte inside the payload (no blind trim)
 - `SerialConn::disconnect` drains any pending channel messages and flushes the partial buffer as a final packet before killing the reader thread — no tail packets are lost on user-initiated Disconnect
+- Parser regression tests cover COBS trailing zero, delimiter framing/splitting/overflow, UBX CRC, and NMEA framing/checksum behavior
