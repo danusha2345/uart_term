@@ -1,5 +1,6 @@
 # UART Терминал (`uart_term`)
 [![Boosty](https://img.shields.io/badge/Boosty-Buy_me_a_coffee-FF7143?logo=boosty&logoColor=white&style=for-the-badge)](https://boosty.to/danusha/donate)
+
 Кроссплатформенный графический терминал для Serial (UART) и BLE, написанный на Rust с использованием фреймворка `egui`. Предназначен для хардверной отладки, реверсинга и анализа произвольных бинарных протоколов. Поддерживает пять режимов фрейминга (Raw, Delimiter, SLIP, COBS, NMEA) и включает автоматическое распознавание UBX-пакетов u-blox и NMEA-предложений.
 
 ## Основные возможности
