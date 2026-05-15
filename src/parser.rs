@@ -263,6 +263,12 @@ impl StreamParser {
 
     pub fn set_delimiter(&mut self, delimiter: Vec<u8>) {
         self.delimiter = delimiter;
+        // Old buffer was framed against the previous delimiter — discard it
+        // so the next packet is not silently merged with stale bytes.
+        self.buffer.clear();
+        self.slip_escape = false;
+        self.unframed = true;
+        self.last_data_time = None;
     }
 
     /// Feed bytes into the parser, returns completed packets.
@@ -530,7 +536,59 @@ impl StreamParser {
         packets
     }
 
+    /// True when the current buffer holds an in-progress framed packet that
+    /// a short pause should NOT flush prematurely. flush() (disconnect) and
+    /// flush_stale() (long timeout) bypass this check on purpose.
+    fn is_mid_frame(&self) -> bool {
+        match self.decoder_type {
+            DecoderType::Raw => false,
+            DecoderType::Delimiter => {
+                !self.unframed
+                    && self.buffer.starts_with(&self.delimiter)
+                    && self.buffer.len() > self.delimiter.len()
+            }
+            DecoderType::Nmea => !self.unframed && self.buffer.first() == Some(&b'$'),
+            // SLIP and COBS clear the buffer at every frame boundary
+            // (END / 0x00). Any pending bytes mean we are mid-frame.
+            DecoderType::Slip | DecoderType::Cobs => !self.buffer.is_empty(),
+        }
+    }
+
+    /// Common path: take buffer, build the right label, build the Packet,
+    /// flag startup garbage as noise. Used by both flush() and gap_flush().
+    fn finalize_buffer(&mut self) -> Option<Packet> {
+        if self.buffer.is_empty() {
+            return None;
+        }
+        let unframed = self.unframed;
+        self.unframed = true;
+        self.slip_escape = false;
+        self.last_data_time = None;
+        let data = std::mem::take(&mut self.buffer);
+        let label = match self.decoder_type {
+            DecoderType::Delimiter => ubx_label(&data, &self.delimiter),
+            DecoderType::Nmea => nmea_label(&data),
+            _ => None,
+        };
+        let mut pkt = Packet::new(
+            self.start_time.elapsed().as_secs_f64(),
+            Direction::Rx,
+            data,
+            label,
+            None,
+        );
+        if matches!(
+            self.decoder_type,
+            DecoderType::Delimiter | DecoderType::Nmea
+        ) && unframed
+        {
+            pkt.noise = true;
+        }
+        Some(pkt)
+    }
+
     /// Flush buffer on gap (pause in data stream). Works for all decoder modes.
+    /// Skips in-progress frames — those wait for flush_stale() or flush().
     pub fn gap_flush(&mut self) -> Option<Packet> {
         if self.buffer.is_empty() {
             return None;
@@ -538,95 +596,33 @@ impl StreamParser {
         if self.decoder_type == DecoderType::Delimiter && self.buffer == self.delimiter {
             return None; // keep delimiter prefix for next packet
         }
-        // Don't flush if assembling a framed packet in Delimiter mode.
-        // Gap was caused by OS scheduling jitter, not a real stream break.
-        // For forced flush (disconnect), use flush() instead.
-        if self.decoder_type == DecoderType::Delimiter
-            && !self.unframed
-            && self.buffer.starts_with(&self.delimiter)
-            && self.buffer.len() > self.delimiter.len()
-        {
+        if self.is_mid_frame() {
             return None;
         }
-        // Same guard for NMEA: if we're mid-sentence (already saw a `$`), let it complete.
-        // flush_stale (500 ms) or flush() on disconnect will eventually drain it.
-        if self.decoder_type == DecoderType::Nmea
-            && !self.unframed
-            && self.buffer.first() == Some(&b'$')
-        {
-            return None;
-        }
-        let unframed = self.unframed;
-        self.last_data_time = None;
-        self.unframed = true; // reset for next accumulation
-        let data = std::mem::take(&mut self.buffer);
-        self.slip_escape = false;
-        let label = match self.decoder_type {
-            DecoderType::Delimiter => ubx_label(&data, &self.delimiter),
-            DecoderType::Nmea => nmea_label(&data),
-            _ => None,
-        };
-        let mut pkt = Packet::new(
-            self.start_time.elapsed().as_secs_f64(),
-            Direction::Rx,
-            data,
-            label,
-            None,
-        );
-        // Data flushed without ever completing a frame is noise
-        if (self.decoder_type == DecoderType::Delimiter || self.decoder_type == DecoderType::Nmea)
-            && unframed
-        {
-            pkt.noise = true;
-        }
-        Some(pkt)
+        self.finalize_buffer()
     }
 
     /// Flush buffered data if no new data arrived within the timeout.
+    /// Bypasses mid-frame guard — long pause means the frame is lost anyway.
     pub fn flush_stale(&mut self, timeout: std::time::Duration) -> Option<Packet> {
         if let Some(last) = self.last_data_time {
             let is_delimiter_only =
                 self.decoder_type == DecoderType::Delimiter && self.buffer == self.delimiter;
             if last.elapsed() >= timeout && !self.buffer.is_empty() && !is_delimiter_only {
-                self.last_data_time = None;
                 return self.flush();
             }
         }
         None
     }
 
-    /// Flush any remaining data as a packet.
+    /// Flush any remaining data as a packet (disconnect path).
     /// For Delimiter mode, skips if buffer contains only the delimiter prefix.
     pub fn flush(&mut self) -> Option<Packet> {
-        if self.buffer.is_empty() {
-            return None;
-        }
         if self.decoder_type == DecoderType::Delimiter && self.buffer == self.delimiter {
             self.buffer.clear();
             return None;
         }
-        let unframed = self.unframed;
-        self.unframed = true;
-        let data = std::mem::take(&mut self.buffer);
-        self.slip_escape = false;
-        let label = match self.decoder_type {
-            DecoderType::Delimiter => ubx_label(&data, &self.delimiter),
-            DecoderType::Nmea => nmea_label(&data),
-            _ => None,
-        };
-        let mut pkt = Packet::new(
-            self.start_time.elapsed().as_secs_f64(),
-            Direction::Rx,
-            data,
-            label,
-            None,
-        );
-        if (self.decoder_type == DecoderType::Delimiter || self.decoder_type == DecoderType::Nmea)
-            && unframed
-        {
-            pkt.noise = true;
-        }
-        Some(pkt)
+        self.finalize_buffer()
     }
 
     pub fn elapsed(&self) -> f64 {
@@ -919,6 +915,74 @@ mod parser_tests {
         assert_eq!(packets.len(), 1);
         assert_eq!(packets[0].data.len(), MAX_BUFFER_SIZE);
         assert!(packets[0].noise);
+    }
+
+    #[test]
+    fn slip_gap_flush_mid_frame_returns_none() {
+        // SLIP frames are bounded by END (0xC0). Buffer non-empty without END
+        // means we're mid-frame — gap_flush must NOT emit a half-decoded packet.
+        let mut p = StreamParser::new(vec![], Instant::now());
+        p.set_decoder_type(DecoderType::Slip);
+        let _ = p.feed(&[0x11, 0x22, 0x33]);
+        assert!(
+            p.gap_flush().is_none(),
+            "SLIP gap_flush must not emit mid-frame data"
+        );
+        // Disconnect-time flush() should still drain it.
+        let tail = p.flush().expect("flush must drain");
+        assert_eq!(tail.data, vec![0x11, 0x22, 0x33]);
+    }
+
+    #[test]
+    fn cobs_gap_flush_mid_frame_returns_none() {
+        // COBS clears buffer at every 0x00 boundary; non-empty buffer = mid-frame.
+        // gap_flush must not emit raw (un-decoded) bytes as a "packet".
+        let mut p = StreamParser::new(vec![], Instant::now());
+        p.set_decoder_type(DecoderType::Cobs);
+        let _ = p.feed(&[0x03, 0x11, 0x22]); // partial COBS run
+        assert!(p.gap_flush().is_none(), "COBS gap_flush must not flush mid-frame");
+    }
+
+    #[test]
+    fn set_delimiter_clears_stale_buffer() {
+        // After delimiter change, leftover bytes must NOT silently merge with
+        // the next packet under the new delimiter.
+        let mut parser = StreamParser::new(vec![0xB5, 0x62], Instant::now());
+        let _ = parser.feed(&[0xB5, 0x62, 0xAA, 0xBB]); // mid-frame UBX
+
+        parser.set_delimiter(vec![0x24]); // switch to '$'
+        let pkts = parser.feed(b"$GP\n");
+        // Buffer was reset to unframed; '$' starts a new frame, so '$GP\n'
+        // accumulates and is split at the '$' boundary.
+        // Important: previous 0xAA 0xBB must NOT appear in any emitted packet.
+        for p in &pkts {
+            assert!(!p.data.contains(&0xAA), "stale AA leaked: {:?}", p.data);
+            assert!(!p.data.contains(&0xBB), "stale BB leaked: {:?}", p.data);
+        }
+        if let Some(tail) = parser.flush() {
+            assert!(!tail.data.contains(&0xAA));
+            assert!(!tail.data.contains(&0xBB));
+        }
+    }
+
+    #[test]
+    fn delimiter_mid_frame_gap_flush_returns_none() {
+        // Same guarantee as NMEA mid_frame_gap_flush_returns_none, for delimiter.
+        let mut parser = StreamParser::new(vec![0xB5, 0x62], Instant::now());
+        let frame = ubx_frame(0x01, 0x07, &[0xAA, 0xBB]);
+        let split = 5;
+        let _ = parser.feed(&frame[..split]); // start frame
+        // Note: first feed flags it as unframed=true initially because no
+        // delimiter has *completed* yet. Push a completing delimiter first.
+        let mut warmup = frame.clone();
+        warmup.extend_from_slice(&[0xB5, 0x62]);
+        let mut parser = StreamParser::new(vec![0xB5, 0x62], Instant::now());
+        let _ = parser.feed(&warmup); // emits one packet, leaves delimiter prefix
+        let _ = parser.feed(&[0xAA, 0xBB]); // mid-frame after sync established
+        assert!(
+            parser.gap_flush().is_none(),
+            "Delimiter gap_flush must not split mid-frame"
+        );
     }
 }
 

@@ -1,10 +1,15 @@
 use crate::app::LogFormat;
 use crate::parser::{Direction, Packet};
 use std::fs::File;
-use std::io::Write;
+use std::io::{BufWriter, Write};
+
+/// 64 KiB output buffer — keeps high-rate logging from doing one syscall per
+/// packet. Combined with the caller's flush() being throttled instead of
+/// per-packet, disk I/O drops by orders of magnitude at multi-Mbps rates.
+const LOG_BUF_SIZE: usize = 64 * 1024;
 
 pub struct Logger {
-    file: File,
+    file: BufWriter<File>,
     format: LogFormat,
     pub last_error: Option<String>,
     /// Timestamp of the first packet (subtracted to get relative time from 0)
@@ -20,7 +25,7 @@ impl Logger {
             .map_err(|e| format!("Cannot open log file: {}", e))?;
 
         let mut logger = Logger {
-            file,
+            file: BufWriter::with_capacity(LOG_BUF_SIZE, file),
             format,
             last_error: None,
             first_packet_time: None,
@@ -91,6 +96,17 @@ impl Logger {
     }
 
     pub fn flush(&mut self) {
+        if let Err(e) = self.file.flush() {
+            self.last_error = Some(format!("Log flush error: {}", e));
+        }
+    }
+}
+
+impl Drop for Logger {
+    fn drop(&mut self) {
+        // Best-effort flush on drop so a Logger replaced by a new one (or
+        // disabled mid-session) doesn't lose its tail buffer to the OS-level
+        // file close path.
         let _ = self.file.flush();
     }
 }

@@ -5,8 +5,14 @@ use crate::ble::{BleCharInfo, BleCmd, BleDeviceInfo, BleHandle, BleMsg};
 use crate::logger::Logger;
 use crate::parser::{self, DecoderType, Direction, Packet, StreamParser};
 use crate::serial::{self, SerialHandle, SerialMsg};
-use std::sync::atomic::AtomicBool;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+/// Hard cap on messages drained from the serial channel per GUI tick.
+/// Prevents one slow frame from blocking the UI on a deep backlog —
+/// the rest is picked up on the next repaint (16 ms later).
+const MAX_MSGS_PER_POLL: usize = 256;
 
 /// Auto-format hex input: uppercase, space between every 2 hex digits
 fn format_hex_input(raw: &str) -> String {
@@ -165,7 +171,7 @@ impl SerialConn {
     fn disconnect(
         &mut self,
         source_idx: u8,
-        packets: &mut Vec<Packet>,
+        packets: &mut VecDeque<Packet>,
         logger: &mut Option<Logger>,
         noise_filter: bool,
     ) {
@@ -184,7 +190,7 @@ impl SerialConn {
                     l.flush();
                 }
             }
-            packets.push(pkt);
+            packets.push_back(pkt);
         }
 
         if let Some(handle) = self.connection.take() {
@@ -197,7 +203,7 @@ impl SerialConn {
     fn poll(
         &mut self,
         source_idx: u8,
-        packets: &mut Vec<Packet>,
+        packets: &mut VecDeque<Packet>,
         logger: &mut Option<Logger>,
         noise_filter: bool,
     ) -> Option<String> {
@@ -206,8 +212,14 @@ impl SerialConn {
         let mut new_packets = Vec::new();
         let mut error_msg = None;
         let mut lost_connection = false;
+        let mut handled = 0usize;
 
-        while let Ok(msg) = handle.rx.try_recv() {
+        while handled < MAX_MSGS_PER_POLL {
+            let msg = match handle.rx.try_recv() {
+                Ok(m) => m,
+                Err(_) => break,
+            };
+            handled += 1;
             match msg {
                 SerialMsg::Data(data) => {
                     let pkts = self.parser.feed(&data);
@@ -227,6 +239,17 @@ impl SerialConn {
                     break;
                 }
             }
+        }
+
+        // Stale-flush as a safety net: flush_stale() only fires if the parser
+        // has been sitting on a non-mid-frame buffer for >500 ms with no
+        // intervening Data/Gap. Mid-frame buffers (UBX in progress, NMEA/SLIP
+        // mid-sentence) are still protected — see is_mid_frame().
+        if let Some(pkt) = self
+            .parser
+            .flush_stale(std::time::Duration::from_millis(500))
+        {
+            new_packets.push(pkt);
         }
 
         if lost_connection {
@@ -295,7 +318,7 @@ pub struct UartTermApp {
 
     // Display
     display_format: DataFormat,
-    packets: Vec<Packet>,
+    packets: VecDeque<Packet>,
     auto_scroll: bool,
     max_packets: usize,
     filter_input: String,
@@ -353,7 +376,7 @@ impl UartTermApp {
             delimiter_input: "B5 62".to_string(),
 
             display_format: DataFormat::HexAscii,
-            packets: Vec::new(),
+            packets: VecDeque::new(),
             auto_scroll: true,
             max_packets: 10000,
             filter_input: String::new(),
@@ -464,8 +487,10 @@ impl UartTermApp {
                 self.status_msg = err;
             }
         }
-        // Sort newly added packets by timestamp for strict chronological order
-        self.packets[start..].sort_by(|a, b| a.timestamp.total_cmp(&b.timestamp));
+        // Sort newly added packets by timestamp for strict chronological order.
+        // VecDeque is a ring buffer, so use make_contiguous() to get a slice.
+        self.packets.make_contiguous()[start..]
+            .sort_by(|a, b| a.timestamp.total_cmp(&b.timestamp));
     }
 
     // --- BLE ---
@@ -539,7 +564,7 @@ impl UartTermApp {
                 logger.log_packet(&pkt);
                 logger.flush();
             }
-            self.packets.push(pkt);
+            self.packets.push_back(pkt);
         }
     }
 
@@ -573,7 +598,7 @@ impl UartTermApp {
                                 logger.log_packet(&pkt);
                                 logger.flush();
                             }
-                            self.packets.push(pkt);
+                            self.packets.push_back(pkt);
                         }
                         self.ble_connected = false;
                         self.ble_chars.clear();
@@ -652,7 +677,7 @@ impl UartTermApp {
                     logger.log_packet(&pkt);
                     logger.flush();
                 }
-                self.packets.push(pkt);
+                self.packets.push_back(pkt);
             }
         }
 
@@ -708,7 +733,7 @@ impl UartTermApp {
                                         logger.log_packet(&pkt);
                                         logger.flush();
                                     }
-                                    self.packets.push(pkt);
+                                    self.packets.push_back(pkt);
                                 }
                                 Err(e) => {
                                     self.status_msg = format!("Send error: {}", e);
@@ -733,7 +758,7 @@ impl UartTermApp {
                                         logger.log_packet(&pkt);
                                         logger.flush();
                                     }
-                                    self.packets.push(pkt);
+                                    self.packets.push_back(pkt);
                                 }
                                 Err(e) => {
                                     self.status_msg = format!("BLE send error: {}", e);
@@ -1395,7 +1420,7 @@ impl UartTermApp {
 
         // Compute time offset so first packet starts at 0 (based on all packets, not filtered)
         if self.first_packet_time.is_none() {
-            if let Some(pkt) = self.packets.first() {
+            if let Some(pkt) = self.packets.front() {
                 self.first_packet_time = Some(pkt.timestamp);
             }
         }
@@ -1677,11 +1702,49 @@ impl eframe::App for UartTermApp {
                 };
                 ui.label(egui::RichText::new(&self.status_msg).color(color).small());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        egui::RichText::new(format!("{} packets", self.packets.len()))
-                            .small()
-                            .color(egui::Color32::from_rgb(140, 140, 140)),
-                    );
+                    // Aggregate per-connection counters from the reader threads.
+                    // Bytes shown as KiB/MiB so high-rate streams stay readable.
+                    let mut bytes: u64 = 0;
+                    let mut gaps: u64 = 0;
+                    let mut errs: u64 = 0;
+                    for conn in &self.serial {
+                        if let Some(ref h) = conn.connection {
+                            bytes += h.stats.bytes_read.load(Ordering::Relaxed);
+                            gaps += h.stats.gaps.load(Ordering::Relaxed);
+                            errs += h.stats.read_errors.load(Ordering::Relaxed);
+                        }
+                    }
+                    let bytes_str = if bytes >= 1024 * 1024 {
+                        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+                    } else if bytes >= 1024 {
+                        format!("{:.1} KiB", bytes as f64 / 1024.0)
+                    } else {
+                        format!("{} B", bytes)
+                    };
+                    let stats_text = if errs > 0 {
+                        format!(
+                            "{} packets | {} | {} gaps | {} err",
+                            self.packets.len(),
+                            bytes_str,
+                            gaps,
+                            errs
+                        )
+                    } else if bytes > 0 || gaps > 0 {
+                        format!(
+                            "{} packets | {} | {} gaps",
+                            self.packets.len(),
+                            bytes_str,
+                            gaps
+                        )
+                    } else {
+                        format!("{} packets", self.packets.len())
+                    };
+                    let stats_color = if errs > 0 {
+                        egui::Color32::from_rgb(255, 140, 100)
+                    } else {
+                        egui::Color32::from_rgb(140, 140, 140)
+                    };
+                    ui.label(egui::RichText::new(stats_text).small().color(stats_color));
                 });
             });
         });
